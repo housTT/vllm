@@ -441,6 +441,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.autoports.ornith_ai_ornith_1_0_35b.tt.generator_vllm:TTQwen3_5MoeForConditionalGeneration"
     )
     _register_model_if_missing(ModelRegistry, "TTQwen3_5MoeForConditionalGeneration", _ornith_target)
+    # Unscoped by construction: this replaces the architecture, not one checkpoint, so every
+    # Qwen3.5-MoE checkpoint served by a TT process resolves to the Ornith-1.0-35B port. Registration
+    # runs at plugin-import time, before any model config exists, so there is nothing here to scope it
+    # against. A foreign checkpoint of that architecture therefore fails loudly inside the port (its
+    # config parser refuses unknown `layer_types`, its loader refuses weights that do not nest under
+    # `model.language_model.`) and the adapter warns as it loads; it does not fall back to upstream. If
+    # a second TT port of this architecture ever lands, this line is the collision to resolve.
     ModelRegistry.register_model("Qwen3_5MoeForConditionalGeneration", _ornith_target)
 
     # Qwen2.5 - Vision

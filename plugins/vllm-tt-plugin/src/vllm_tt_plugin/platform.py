@@ -415,6 +415,34 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM",
     )
 
+    # Qwen3.5-MoE (ornith-ai/Ornith-1.0-35B) - text-only bridge on a 1x4 Blackhole ring.
+    # The checkpoint is the hybrid Qwen3.5-MoE text decoder (10 paged-KV full-attention layers, 30
+    # gated-DeltaNet recurrent layers) plus a vision tower the TT port does not implement, so the
+    # adapter is text-only and does not declare SupportsMultiModal.
+    #
+    # The plain HF arch is registered too, and it *replaces* upstream's class. Everything
+    # ``ModelConfig`` decides before ``check_and_update_config`` prepends ``TT`` is decided from the
+    # class it resolves then, and for this checkpoint upstream's class makes two decisions that are
+    # wrong for the TT port:
+    #
+    #   * it is multimodal, so ``multimodal_config`` is populated and ``MultiModalRegistry`` later
+    #     asserts a ``_processor_factory`` on the resolved *TT* class (the same nested-config trap the
+    #     Gemma4 block below documents);
+    #   * it is ``IsHybrid``, so ``verify_and_update_config`` raises ``cache_config.block_size`` until
+    #     an attention page holds a whole GDN state (1072 tokens here) -- a GPU-side constraint about
+    #     sharing one tensor pool. The TT port keeps its recurrent state inside the model, so its paged
+    #     attention blocks are its own 64-token blocks and a rewritten block size simply does not
+    #     match the cache it allocates.
+    #
+    # Replacing the arch is safe in this process: the TT platform is selected only when ttnn is
+    # importable, and upstream's CUDA implementation cannot serve the checkpoint there. The TT adapter
+    # carries the small vLLM-model interface the registry introspects (see its module docstring).
+    _ornith_target = (
+        "models.autoports.ornith_ai_ornith_1_0_35b.tt.generator_vllm:TTQwen3_5MoeForConditionalGeneration"
+    )
+    _register_model_if_missing(ModelRegistry, "TTQwen3_5MoeForConditionalGeneration", _ornith_target)
+    ModelRegistry.register_model("Qwen3_5MoeForConditionalGeneration", _ornith_target)
+
     # Qwen2.5 - Vision
     _register_model_if_missing(
         ModelRegistry,

@@ -87,13 +87,32 @@ def apply_cached_req_state_update(
     num_computed_tokens: int,
     new_block_ids,
     resumed_from_preemption: bool,
-) -> None:
+    *,
+    num_output_tokens: int | None = None,
+    all_token_ids: list[int] | None = None,
+    in_persistent_batch: bool = True,
+    async_scheduling: bool = False,
+) -> bool:
     """Apply a ``scheduled_cached_reqs`` update to a request's cached state.
 
     Identical for front-packed and lane-DP: a request resumed from preemption
     had its KV freed and rebuilt (replace block IDs), otherwise the newly
     allocated blocks are appended. Persistent-batch row bookkeeping is left to
     the caller.
+
+    The runner appends every token the device produced to
+    ``req_state.output_token_ids``, but the scheduler is free to throw a token
+    away after the fact - under async scheduling a preemption invalidates the
+    decode steps still in the pipeline, so those tokens never become part of
+    the request. Without a resync the runner's copy of the request runs ahead
+    of the scheduler's, ``InputBatch.num_tokens`` is seeded one too high on
+    resume, and the re-prefill is then misread as an unfinished chunk and
+    returns no sampled token at all. ``CachedRequestData.num_output_tokens``
+    (output tokens plus async placeholders) is the scheduler's authoritative
+    count, so reconcile against it, mirroring ``gpu_model_runner._update_states``.
+
+    Returns True when ``req_state.output_token_ids`` was changed, so the caller
+    can refresh the persistent-batch row length.
     """
     req_state.num_computed_tokens = num_computed_tokens
     if resumed_from_preemption:
@@ -102,6 +121,28 @@ def apply_cached_req_state_update(
     elif new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
             block_ids.extend(new_ids)
+
+    if num_output_tokens is None:
+        return False
+
+    if not in_persistent_batch:
+        # Not in the persistent batch: either resumed from preemption or not
+        # scheduled last step. It is re-added from req_state below, so rebuild
+        # the output history from the scheduler's own token list.
+        if async_scheduling and num_output_tokens > 0 and all_token_ids is not None:
+            recovered = list(all_token_ids[-num_output_tokens:])
+            if recovered != req_state.output_token_ids:
+                # Rebinding is safe here: the request holds no persistent-batch
+                # row, and add_request() re-registers the new list.
+                req_state.output_token_ids = recovered
+                return True
+        return False
+
+    if num_output_tokens < len(req_state.output_token_ids):
+        # Truncate in place: the persistent batch aliases this list.
+        del req_state.output_token_ids[num_output_tokens:]
+        return True
+    return False
 
 
 def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
@@ -227,6 +268,10 @@ class InputBatch:
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
 
+        # Set by the model runner: under async scheduling the scheduler may
+        # invalidate decode tokens the runner already applied, so cached
+        # request state has to be reconciled on resume.
+        self.async_scheduling = False
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_computed_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
@@ -887,8 +932,17 @@ class TTLaneInputBatch(InputBatch):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
-            apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            req_index = self.req_id_to_index.get(req_id)
+            in_persistent_batch = req_index is not None and not resumed_from_preemption
+            output_tokens_changed = apply_cached_req_state_update(
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                num_output_tokens=req_data.num_output_tokens[i],
+                all_token_ids=req_data.all_token_ids.get(req_id),
+                in_persistent_batch=in_persistent_batch,
+                async_scheduling=self.async_scheduling,
             )
             if resumed_from_preemption:
                 # KV was freed and is being rebuilt; re-add fresh (drop the
@@ -899,11 +953,14 @@ class TTLaneInputBatch(InputBatch):
                     layout_changed = True
                 req_ids_to_add.append(req_id)
                 continue
-            req_index = self.req_id_to_index.get(req_id)
             if req_index is None:
                 req_ids_to_add.append(req_id)
                 continue
             self.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if output_tokens_changed:
+                self.num_tokens[req_index] = (
+                    self.num_prompt_tokens[req_index] + req_data.num_output_tokens[i]
+                )
             if new_block_ids is not None:
                 self.block_table.append_row(new_block_ids, req_index)
 

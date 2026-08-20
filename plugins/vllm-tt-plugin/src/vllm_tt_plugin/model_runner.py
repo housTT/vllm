@@ -350,6 +350,13 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
             )
 
+        # Under async scheduling the scheduler can invalidate decode tokens
+        # that this runner already applied to its cached request state (a
+        # preempted request's in-flight tokens are dropped). The batch needs to
+        # know so it can resync a resumed request from the scheduler's own
+        # token list instead of trusting its own history.
+        self.input_batch.async_scheduling = self.scheduler_config.async_scheduling
+
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
         # does not take into account num blocks in KV cache. Actual max is
@@ -664,13 +671,20 @@ class TTModelRunner:
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            req_index = self.input_batch.req_id_to_index.get(req_id)
 
             # Update the cached states.
-            apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+            output_tokens_changed = apply_cached_req_state_update(
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                num_output_tokens=req_data.num_output_tokens[i],
+                all_token_ids=req_data.all_token_ids.get(req_id),
+                in_persistent_batch=req_index is not None,
+                async_scheduling=self.input_batch.async_scheduling,
             )
 
-            req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
@@ -680,6 +694,11 @@ class TTModelRunner:
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if output_tokens_changed:
+                self.input_batch.num_tokens[req_index] = (
+                    self.input_batch.num_prompt_tokens[req_index]
+                    + req_data.num_output_tokens[i]
+                )
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 

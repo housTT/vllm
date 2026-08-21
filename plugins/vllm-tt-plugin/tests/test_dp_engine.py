@@ -4,8 +4,13 @@
 
 from types import SimpleNamespace
 
+import pytest
 import vllm_tt_plugin.engine as engine_module
-from vllm_tt_plugin.engine import TTDPEngineCoreProc
+from vllm_tt_plugin.engine import (
+    TTDPEngineCoreProc,
+    _get_grouped_ornith_prefill_target,
+    _get_input_queue_batching_delay,
+)
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 
 
@@ -15,6 +20,406 @@ def _core_with_scheduler(scheduler):
     core.dp_group = object()
     core.dlog = lambda *args, **kwargs: None
     return core
+
+
+def _queue_delay_config(
+    *,
+    model_type: str,
+    max_num_seqs: int,
+    max_num_partial_prefills: int,
+    override: float | None = None,
+):
+    tt_config = {}
+    if override is not None:
+        tt_config["input_queue_batching_delay"] = override
+    return SimpleNamespace(
+        additional_config={"tt": tt_config},
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_partial_prefills=max_num_partial_prefills,
+        ),
+    )
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, duration):
+        self.now += duration
+
+
+class _ScriptedInputQueue:
+    """Deterministic blocking queue without an ``empty()`` race surface."""
+
+    def __init__(self, clock, events=()):
+        self.clock = clock
+        self.events = list(events)
+        self.blocking_timeouts = []
+        self.nowait_calls = 0
+
+    def get(self, *, timeout):
+        self.blocking_timeouts.append(timeout)
+        if not self.events:
+            self.clock.advance(timeout)
+            raise engine_module.queue.Empty
+        arrival_delay, request = self.events.pop(0)
+        if arrival_delay > timeout:
+            self.clock.advance(timeout)
+            raise engine_module.queue.Empty
+        self.clock.advance(arrival_delay)
+        return request
+
+    def get_nowait(self):
+        self.nowait_calls += 1
+        if not self.events or self.events[0][0] > 0:
+            raise engine_module.queue.Empty
+        _, request = self.events.pop(0)
+        return request
+
+
+class _QueueScheduler:
+    def __init__(self, *, num_running=0, num_waiting=0):
+        self.num_running = num_running
+        self.num_waiting = num_waiting
+
+    def has_requests(self):
+        return self.num_running > 0 or self.num_waiting > 0
+
+    def get_request_counts(self):
+        return self.num_running, self.num_waiting
+
+
+def _queue_processing_core(config, scheduler, input_queue, *, engines_running=True):
+    core = TTDPEngineCoreProc.__new__(TTDPEngineCoreProc)
+    core.vllm_config = config
+    core.scheduler = scheduler
+    core.input_queue = input_queue
+    core.engines_running = engines_running
+    core.batch_queue = None
+    core._dp_in_flight = None
+    core._scheduler_paused = False
+    handled = []
+
+    def handle(request_type, request):
+        handled.append((request_type, request))
+        if request_type == "add":
+            scheduler.num_waiting += 1
+
+    core._handle_client_request = handle
+    return core, handled
+
+
+@pytest.mark.parametrize(
+    ("model_type", "max_num_seqs", "max_num_partial_prefills", "expected"),
+    [
+        ("qwen3_5_moe", 8, 4, 0.250),
+        ("qwen3_5_moe", 1, 4, 0.002),
+        ("qwen3_5_moe", 8, 1, 0.002),
+        ("gemma4", 8, 4, 0.002),
+    ],
+)
+def test_input_queue_batching_delay_is_wider_only_for_grouped_ornith_prefill(
+    model_type,
+    max_num_seqs,
+    max_num_partial_prefills,
+    expected,
+):
+    config = _queue_delay_config(
+        model_type=model_type,
+        max_num_seqs=max_num_seqs,
+        max_num_partial_prefills=max_num_partial_prefills,
+    )
+
+    assert _get_input_queue_batching_delay(config) == expected
+
+
+@pytest.mark.parametrize("override", [0.0, 0.013])
+def test_input_queue_batching_delay_honors_explicit_tt_override(override):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+        override=override,
+    )
+
+    assert _get_input_queue_batching_delay(config) == override
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "max_num_partial_prefills", "expected"),
+    [(8, 4, 4), (2, 4, 2), (8, 2, 2)],
+)
+def test_grouped_ornith_prefill_target_uses_tighter_scheduler_limit(
+    max_num_seqs,
+    max_num_partial_prefills,
+    expected,
+):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=max_num_seqs,
+        max_num_partial_prefills=max_num_partial_prefills,
+    )
+
+    assert _get_grouped_ornith_prefill_target(config) == expected
+
+
+def test_input_queue_blocking_get_wakes_immediately_and_stops_blocking_at_target(
+    monkeypatch,
+):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock, [(0.0, ("add", "request-4"))])
+    scheduler = _QueueScheduler(num_waiting=3)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("add", "request-4")]
+    assert scheduler.num_waiting == 4
+    assert input_queue.blocking_timeouts == pytest.approx([0.250])
+    assert input_queue.nowait_calls == 1
+    assert clock.now == 0.0
+
+
+def test_input_queue_does_not_block_past_grouped_target(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock, [(0.010, ("add", "request-5"))])
+    scheduler = _QueueScheduler(num_waiting=4)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == []
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 1
+    assert len(input_queue.events) == 1
+
+
+def test_input_queue_drains_arrived_control_message_at_grouped_target(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock, [(0.0, ("abort", "request-2"))])
+    scheduler = _QueueScheduler(num_waiting=4)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("abort", "request-2")]
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 2
+
+
+def test_active_wave_rank_without_local_requests_never_coalesces(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock)
+    scheduler = _QueueScheduler()
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == []
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 1
+    assert clock.now == 0.0
+
+
+def test_running_decode_never_coalesces_but_drains_arrived_messages(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(
+        clock,
+        [
+            (0.0, ("abort", "running-request")),
+            (0.010, ("add", "future-request")),
+        ],
+    )
+    scheduler = _QueueScheduler(num_running=1, num_waiting=1)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("abort", "running-request")]
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 2
+    assert len(input_queue.events) == 1
+    assert clock.now == 0.0
+
+
+def test_zero_delay_override_drains_arrived_messages_without_blocking(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+        override=0.0,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(
+        clock,
+        [
+            (0.0, ("add", "request-2")),
+            (0.010, ("add", "future-request")),
+        ],
+    )
+    scheduler = _QueueScheduler(num_waiting=1)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("add", "request-2")]
+    assert scheduler.num_waiting == 2
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 2
+    assert len(input_queue.events) == 1
+    assert clock.now == 0.0
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("batch_queue", [object()]),
+        ("_dp_in_flight", object()),
+        ("_scheduler_paused", True),
+    ],
+)
+def test_input_queue_never_coalesces_while_other_engine_work_is_pending(
+    monkeypatch,
+    attribute,
+    value,
+):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock)
+    scheduler = _QueueScheduler(num_waiting=1)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    setattr(core, attribute, value)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == []
+    assert input_queue.blocking_timeouts == []
+    assert input_queue.nowait_calls == 1
+    assert clock.now == 0.0
+
+
+def test_input_queue_uses_one_absolute_coalescing_deadline(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(
+        clock,
+        [
+            (0.100, ("utility", "status")),
+            (0.100, ("add", "request-2")),
+        ],
+    )
+    scheduler = _QueueScheduler(num_waiting=1)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("utility", "status"), ("add", "request-2")]
+    assert input_queue.blocking_timeouts == pytest.approx([0.250, 0.150, 0.050])
+    assert input_queue.nowait_calls == 1
+    assert clock.now == pytest.approx(0.250)
+
+
+def test_input_queue_drains_fifo_messages_already_queued_at_deadline(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(
+        clock,
+        [
+            (0.0, ("utility", "slow-status")),
+            (0.0, ("abort", "request-2")),
+        ],
+    )
+    scheduler = _QueueScheduler(num_waiting=1)
+    core, handled = _queue_processing_core(config, scheduler, input_queue)
+
+    def handle(request_type, request):
+        handled.append((request_type, request))
+        if request == "slow-status":
+            clock.advance(0.250)
+
+    core._handle_client_request = handle
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == [("utility", "slow-status"), ("abort", "request-2")]
+    assert input_queue.blocking_timeouts == pytest.approx([0.250])
+    assert input_queue.nowait_calls == 2
+    assert clock.now == pytest.approx(0.250)
+
+
+def test_idle_input_queue_timeout_returns_to_dp_loop_once(monkeypatch):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock)
+    scheduler = _QueueScheduler()
+    core, handled = _queue_processing_core(
+        config,
+        scheduler,
+        input_queue,
+        engines_running=False,
+    )
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+
+    core._process_input_queue()
+
+    assert handled == []
+    assert input_queue.blocking_timeouts == pytest.approx([0.002])
+    assert clock.now == pytest.approx(0.002)
 
 
 def test_dp_negotiation_prefers_running_prefill_continuation(monkeypatch):

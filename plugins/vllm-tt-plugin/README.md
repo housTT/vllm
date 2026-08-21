@@ -273,7 +273,7 @@ Common options:
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
-| `input_queue_batching_delay` | Short idle delay in seconds to allow more requests to coalesce before TT execution. Default: `0.002`. |
+| `input_queue_batching_delay` | Event-driven input-queue coalescing timeout in seconds. Default: `0.250` for grouped Qwen3.5-MoE prefills; `0.002` otherwise. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 | `rank_binding` | Rank-binding YAML used for `tt-run` / MPI launches. |

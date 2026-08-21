@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
@@ -9,9 +10,218 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
+from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
+
+# ---------------------------------------------------------------- prefill admission cap
+#
+# How many requests one prefill step may carry. TT prefill is a *sequential* loop
+# over the batch on the model side (one ``prefill_request_into_slot`` call per
+# request), so a step that admits N requests costs N x T either way -- but vLLM
+# publishes a step's sampled tokens only when the step returns, so all N first
+# tokens are withheld until the last request's prefill finishes. Admitting one
+# request per step releases each first token as soon as its own prefill completes:
+# for a wave of N arriving together, mean TTFT drops from N x T to (N + 1) / 2 x T.
+# Nothing about the computation changes -- same per-request prefill call, same
+# state slot (see ``_schedule_prefill_only``).
+#
+# It is not free, and the cost grows with prompt length. The model's
+# ``_ensure_traces_replay_safe`` runs at every prefill-step entry and re-captures
+# the decode traces when the previous step compiled new programs, so splitting one
+# wave into N steps moves up to N - 1 re-captures *inside* the wave. A re-capture's
+# cost scales with the prefill program set, which scales with the number of 2048-token
+# chunk offsets a prompt spans. That inserted time lands between each early request's
+# first and second token, so it shows up as TPOT.
+#
+# Measured on 4x Blackhole p300c, batch 8, OSL 512, full occupancy:
+#
+#   ISL   1024:  TTFT median -42.9%,  TPOT +5.5%   -> worth it
+#   ISL  65536:  TTFT median -17.7%,  TPOT +21.9%  -> not worth it
+#
+# Hence the length gate: the cap applies automatically only to prompts at or below
+# ``prefill_cap_max_prompt_len``. See ``_PrefillCapPolicy`` for how the default
+# threshold was derived and what it is still missing.
+#
+# ``cap = None`` means "no cap", i.e. filling the step with every admissible
+# waiting request, which is the behaviour before this cap existed.
+_PREFILL_CAP_ENV = "TT_MAX_PREFILLS_PER_STEP"
+_PREFILL_CAP_KEY = "max_prefills_per_step"
+DEFAULT_MAX_PREFILLS_PER_STEP = 1
+
+_PREFILL_CAP_LEN_ENV = "TT_PREFILL_CAP_MAX_PROMPT_LEN"
+_PREFILL_CAP_LEN_KEY = "prefill_cap_max_prompt_len"
+
+# Sentinel threshold meaning "no prompt is above it", i.e. the cap always applies.
+_UNBOUNDED_PROMPT_LEN = 1 << 62
+
+# Threshold in prompt tokens, inclusive: at or below it the cap is on, above it off.
+#
+# None means no threshold: the cap applies at every prompt length. That is the
+# default because the cap was measured to be free at every length tested.
+#
+# An earlier revision defaulted this to 4096, on a model that read the cap's cost
+# off mean TPOT (+5.5% at ISL 1024, +21.9% at 65536) and set the threshold to keep
+# that under 10%. The model was not wrong about mean TPOT -- a later measurement at
+# ISL 8192 came in at +41.3%, steeper still. It was wrong that mean TPOT is a cost.
+#
+# vllm bench serve computes TPOT as (e2e_latency - TTFT) / (output_tokens - 1). A
+# request that has finished its own prefill but sits behind other requests' prefills
+# produces no tokens, and that idle time is charged to its TPOT. Capping admission
+# starts each request's first token earlier, so each request spends more of its life
+# in that waiting state -- mean TPOT rises while nothing gets slower. The time is
+# moved from "waiting for the first token" into "gaps between tokens", and the total
+# is conserved. Measured, cap ON vs OFF, batch 8, OSL 512, same session back-to-back:
+#
+#              ISL 8192 (n=48)        ISL 65536 (n=16)
+#   e2e mean         +0.0%                  -0.1%
+#   e2e p99          -0.1%                  -0.1%
+#   aggregate        -0.0%                  +0.1%
+#   median ITL       +0.2%                  +0.1%
+#   TTFT median     -43.2%                 -10.8%
+#   mean TPOT       +41.3%                 +37.4%
+#
+# So the cap buys a large TTFT improvement for no measurable change in end-to-end
+# latency, throughput, or decode step time, and a 4096 threshold would switch that
+# win off for every prompt above 4096 tokens.
+#
+# Set this to a token count to restore the threshold behaviour. The reason to do so
+# is a deployment that values smooth streaming over fast first tokens: mean TPOT is
+# not a decode metric, but choppier inter-token spacing is real and a user can feel
+# it even when the request finishes at the same moment. Judge that with median ITL
+# (unchanged here) alongside mean TPOT, never mean TPOT alone.
+DEFAULT_PREFILL_CAP_MAX_PROMPT_LEN = _UNBOUNDED_PROMPT_LEN
+
+
+@dataclass(frozen=True)
+class _PrefillCapPolicy:
+    """Resolved prefill-admission policy.
+
+    ``cap`` is the per-step admission ceiling, or ``None`` for no cap at all.
+    ``explicit`` records that an operator set ``cap`` by hand, in which case it
+    applies to every prompt and the length gate is bypassed entirely -- an explicit
+    setting must beat anything chosen automatically. ``max_prompt_len`` is the
+    automatic gate's threshold in prompt tokens, inclusive.
+    """
+
+    cap: int | None
+    explicit: bool
+    max_prompt_len: int
+
+    def describe(self) -> str:
+        if self.cap is None:
+            return (
+                "uncapped"
+                if self.explicit
+                else "uncapped (no cap configured)"
+            )
+        if self.explicit:
+            return f"{self.cap} prefill(s) per step for every prompt (set explicitly)"
+        if self.max_prompt_len >= _UNBOUNDED_PROMPT_LEN:
+            return f"{self.cap} prefill(s) per step for every prompt (no threshold)"
+        return (
+            f"{self.cap} prefill(s) per step for prompts <= {self.max_prompt_len} "
+            "tokens, uncapped above"
+        )
+
+
+def _parse_prefill_cap(raw: object, source: str) -> int | None:
+    """Read a prefill-admission cap. ``0``/``""``/``none``/``off`` mean no cap."""
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("", "none", "off", "unlimited"):
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(
+                f"{source} must be a non-negative integer "
+                f'(or "none"/"off" for no cap), got {raw!r}'
+            ) from None
+    elif isinstance(raw, bool):
+        # ``true`` is the natural way to ask for the default cap in JSON config.
+        return DEFAULT_MAX_PREFILLS_PER_STEP if raw else None
+    elif isinstance(raw, int):
+        value = raw
+    else:
+        raise ValueError(f"{source} must be an integer, got {raw!r}")
+    if value < 0:
+        raise ValueError(f"{source} must be >= 0, got {raw!r}")
+    return None if value == 0 else value
+
+
+def _parse_prompt_len(raw: object, source: str) -> int:
+    """Read the length gate's threshold. ``0`` disables the gate (cap everything)."""
+    if isinstance(raw, bool):
+        raise ValueError(f"{source} must be an integer token count, got {raw!r}")
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("", "none", "off"):
+            # "no threshold" means nothing is above it.
+            return _UNBOUNDED_PROMPT_LEN
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(
+                f"{source} must be a non-negative integer token count, got {raw!r}"
+            ) from None
+    elif isinstance(raw, int):
+        value = raw
+    else:
+        raise ValueError(f"{source} must be an integer token count, got {raw!r}")
+    if value < 0:
+        raise ValueError(f"{source} must be >= 0, got {raw!r}")
+    return value
+
+
+
+def _read_setting(vllm_config, env: str, key: str) -> tuple[object | None, str]:
+    """Read one setting from the environment, else the TT config namespace."""
+    raw = os.getenv(env)
+    if raw is not None:
+        return raw, env
+    try:
+        raw = get_tt_config(vllm_config).get(key)
+    except Exception:  # noqa: BLE001 - a malformed namespace is not ours to raise on
+        raw = None
+    return raw, f'additional_config["tt"]["{key}"]'
+
+
+def resolve_prefill_cap_policy(vllm_config) -> _PrefillCapPolicy:
+    """Resolve the prefill-admission policy.
+
+    Precedence for each setting: the environment variable, then
+    ``additional_config={"tt": {...}}``, then the default.
+
+    - ``max_prefills_per_step`` / ``TT_MAX_PREFILLS_PER_STEP``: the per-step
+      ceiling. Setting it explicitly (to any value, ``0`` included) makes it apply
+      to every prompt regardless of length -- the operator override.
+    - ``prefill_cap_max_prompt_len`` / ``TT_PREFILL_CAP_MAX_PROMPT_LEN``: the
+      automatic gate's threshold in prompt tokens. Only consulted when the cap was
+      *not* set explicitly. ``0`` disables the cap for every prompt; ``"none"``
+      applies it to every prompt.
+    """
+    raw_cap, cap_source = _read_setting(vllm_config, _PREFILL_CAP_ENV, _PREFILL_CAP_KEY)
+    raw_len, len_source = _read_setting(
+        vllm_config, _PREFILL_CAP_LEN_ENV, _PREFILL_CAP_LEN_KEY
+    )
+    max_prompt_len = (
+        DEFAULT_PREFILL_CAP_MAX_PROMPT_LEN
+        if raw_len is None
+        else _parse_prompt_len(raw_len, len_source)
+    )
+    if raw_cap is not None:
+        return _PrefillCapPolicy(
+            cap=_parse_prefill_cap(raw_cap, cap_source),
+            explicit=True,
+            max_prompt_len=max_prompt_len,
+        )
+    return _PrefillCapPolicy(
+        cap=DEFAULT_MAX_PREFILLS_PER_STEP,
+        explicit=False,
+        max_prompt_len=max_prompt_len,
+    )
 
 
 @dataclass
@@ -111,6 +321,14 @@ class TTScheduler(AsyncScheduler):
       when pending prefill work exists (waiting queue or partial-prefill
       continuations), falling back to decode-only when prefill cannot make
       progress and running decode requests exist.
+
+    Prefill admission is capped at ``max_prefills_per_step`` requests per step
+    (default 1) so each request's first token is published by the step that
+    prefilled it instead of being withheld until the rest of the wave finishes.
+    The cap is applied automatically only to prompts at or below
+    ``prefill_cap_max_prompt_len`` tokens, because its cost grows with prompt
+    length while its benefit does not; an explicit operator setting bypasses that
+    gate. See ``resolve_prefill_cap_policy``.
     """
 
     waiting: RequestQueue
@@ -120,6 +338,13 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._prefill_cap = resolve_prefill_cap_policy(self.vllm_config)
+        # Last automatic decision, so a step with nothing new to admit (a
+        # partial-prefill continuation on its own) keeps the wave's decision
+        # rather than silently flipping, and so a flip can be logged when it
+        # actually happens.
+        self._auto_cap_active: bool | None = None
+        logger.info(f"TT prefill admission: {self._prefill_cap.describe()}")
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -173,6 +398,69 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         return scheduler_output
 
+    def _pending_prompt_len(self) -> int | None:
+        """Prompt length of the request the waiting loop would admit next.
+
+        One peek at the front of the waiting queue -- no scan, no allocation, and
+        the same request the base scheduler is about to pop. ``None`` when nothing
+        is waiting, which means this step has no new admission to gate.
+        """
+        if not self.waiting:
+            return None
+        try:
+            return int(self.waiting.peek_request().num_prompt_tokens)
+        except (IndexError, AttributeError):
+            # An empty queue that still tested truthy, or a request type without
+            # the attribute: neither is worth failing a scheduling step over.
+            return None
+
+    def _effective_prefill_cap(self) -> int | None:
+        """Per-step prefill admission ceiling, ``None`` for no cap.
+
+        An explicit operator setting wins unconditionally. Otherwise the cap is
+        gated on the next waiting request's prompt length: at or below the
+        threshold the cap pays for itself (measured -42.9% TTFT median for +5.5%
+        TPOT at ISL 1024), above it the per-step trace re-capture cost dominates
+        (-17.7% TTFT median for +21.9% TPOT at ISL 65536).
+        """
+        policy = self._prefill_cap
+        if policy.cap is None or policy.explicit:
+            return policy.cap
+
+        length = self._pending_prompt_len()
+        if length is None:
+            # Nothing new to admit this step; hold the wave's current decision.
+            active = self._auto_cap_active
+            return policy.cap if active else None
+
+        active = length <= policy.max_prompt_len
+        if policy.max_prompt_len >= _UNBOUNDED_PROMPT_LEN:
+            # No threshold: the decision can never flip, so say it once and plainly
+            # rather than quoting a sentinel at whoever is reading the log.
+            if self._auto_cap_active is None:
+                logger.info(
+                    f"TT prefill admission: capping admission at {policy.cap} "
+                    f"prefill(s) per step for every prompt (no length threshold); "
+                    f"first request is {length} token(s)"
+                )
+            self._auto_cap_active = True
+            return policy.cap
+        if active != self._auto_cap_active:
+            side = "at or below" if active else "above"
+            outcome = (
+                f"capping admission at {policy.cap} prefill(s) per step"
+                if active
+                else "leaving admission uncapped"
+            )
+            which = "first request" if self._auto_cap_active is None else "pending prompt"
+            switch = "" if self._auto_cap_active is None else "switching to "
+            logger.info(
+                f"TT prefill admission: {which} is {length} token(s), {side} the "
+                f"{policy.max_prompt_len}-token threshold - {switch}{outcome}"
+            )
+            self._auto_cap_active = active
+        return policy.cap if active else None
+
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests + partial-prefill continuations.
 
@@ -180,13 +468,43 @@ class TTScheduler(AsyncScheduler):
         scheduler's running loop only processes partial-prefill continuations and
         the waiting loop admits new prefills.  Adjusts ``max_num_running_reqs`` to
         account for hidden decode slots.
+
+        ``max_num_running_reqs`` is the only gate on the base scheduler's waiting
+        loop (``Scheduler.schedule`` breaks out of it once ``len(self.running)``
+        reaches it), so lowering it here is also how the per-step prefill cap is
+        applied: with ``running`` reduced to the partial-prefill continuations, a
+        ceiling of ``cap`` admits at most ``cap`` new prefills. Two properties the
+        base scheduler's ``assert len(self.running) <= self.max_num_running_reqs``
+        depends on:
+
+        - the ceiling is never lowered below ``len(partial_prefills)``, which is
+          what ``self.running`` already holds on entry (the running loop must be
+          free to advance every continuation it was given);
+        - it is never raised above the free-slot count, so the cap can only ever
+          admit *fewer* requests than the uncapped policy, never more.
+
+        ``_effective_prefill_cap`` decides whether the cap applies at all for the
+        prompt about to be admitted; ``None`` from it restores the pre-cap policy
+        line for line.
+
+        Admitting one at a time does not change which slot a request gets. The
+        runner's ``_alloc_prefill_state_slots`` gives local row ``j`` the ``j``-th
+        smallest slot not held off-batch, and it commits each assignment to
+        ``_req_state_slot`` before the next step reads it as held -- so N requests
+        admitted over N steps land on exactly the slots the one batched step would
+        have given them, in the same FCFS order. See the slot-remap note in the
+        stage write-up.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        prefill_capacity = max(0, saved_max - len(pure_decodes))
+        cap = self._effective_prefill_cap()
+        if cap is not None:
+            prefill_capacity = max(len(partial_prefills), min(prefill_capacity, cap))
         self.running = partial_prefills
-        self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        self.max_num_running_reqs = prefill_capacity
         try:
             result = super().schedule()
         finally:

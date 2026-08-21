@@ -32,6 +32,8 @@ logger = init_tt_logger(__name__)
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
+TT_ENGINE_CORE_PROC_CLS = "vllm_tt_plugin.engine.TTEngineCoreProc"
+TT_DP_ENGINE_CORE_PROC_CLS = "vllm_tt_plugin.engine.TTDPEngineCoreProc"
 
 # TT model versions backed by the single-execute Galaxy generator
 # (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these, gathered
@@ -42,16 +44,24 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
-# TT model types that have been validated with real chunked prefill. Qwen3.5-MoE resolves to the
-# Ornith text adapter registered below; that adapter preserves recurrent DeltaNet state in dedicated
-# B1/B2/B4 packs and migrates authoritative rows device-side when preemption shrinks a wave.
+# TT model types that have been validated with real chunked prefill.
+# Qwen3.5-MoE resolves to the Ornith text adapter registered below; that
+# adapter preserves recurrent DeltaNet state in dedicated B1/B2/B4 packs and
+# migrates authoritative rows device-side when preemption shrinks a wave.
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified", "qwen3_5_moe"}
 
-# Ornith executes one synchronized device prefill over up to four 2048-token request rows.  The
-# scheduler budget is global, so it must reserve four chunks while the per-request threshold keeps
-# each row on the model's compiled boundary.
+# Ornith executes one synchronized device prefill over up to four 2048-token
+# request rows. The scheduler budget is global, so it must reserve four chunks
+# while the per-request threshold keeps each row on the model's compiled
+# boundary.
 _ORNITH_PREFILL_CHUNK = 2048
 _ORNITH_PREFILL_BATCH = 4
+
+
+def _set_tt_engine_core_proc_classes(parallel_config) -> None:
+    """Route both DP=1 and gathered-DP through TT queue handling."""
+    parallel_config.engine_core_proc_cls = TT_ENGINE_CORE_PROC_CLS
+    parallel_config.dp_engine_core_proc_cls = TT_DP_ENGINE_CORE_PROC_CLS
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
@@ -67,11 +77,13 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
         # so it stays off for every model type below.
         scheduler_config.disable_chunked_mm_input = True
         if model_type == "qwen3_5_moe" and scheduler_config.enable_chunked_prefill:
-            # Ornith's DeltaNet continuation requires every start position to be a multiple of its
-            # compiled 2048-token prefill block. A smaller scheduler budget produces an illegal next
-            # start (e.g. 1024); a larger one hides multiple model blocks inside one scheduler step
-            # and prevents decode from running between them. Pin both knobs, including configurations
-            # previously expanded to max_model_len while this model was not on the allow-list.
+            # Ornith's DeltaNet continuation requires every start position to
+            # be a multiple of its compiled 2048-token prefill block. A smaller
+            # scheduler budget produces an illegal next start (e.g. 1024); a
+            # larger one hides multiple model blocks inside one scheduler step
+            # and prevents decode from running between them. Pin both knobs,
+            # including configurations previously expanded to max_model_len
+            # while this model was not on the allow-list.
             grouped_budget = _ORNITH_PREFILL_CHUNK * _ORNITH_PREFILL_BATCH
             if scheduler_config.max_num_batched_tokens != grouped_budget:
                 logger.info(
@@ -86,9 +98,10 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
             scheduler_config.max_long_partial_prefills = _ORNITH_PREFILL_BATCH
             scheduler_config.long_prefill_token_threshold = _ORNITH_PREFILL_CHUNK
         elif model_type == "qwen3_5_moe":
-            # Without scheduler chunking the base scheduler must admit the whole prompt in one
-            # step. Keeping the 2048 boundary pin here would therefore strand every longer prompt,
-            # including lengths inside Ornith's advertised 262144-token context.
+            # Without scheduler chunking the base scheduler must admit the
+            # whole prompt in one step. Keeping the 2048 boundary pin here
+            # would therefore strand every longer prompt, including lengths
+            # inside Ornith's advertised 262144-token context.
             scheduler_config.max_num_batched_tokens = max(
                 scheduler_config.max_num_batched_tokens,
                 model_config.max_model_len,
@@ -451,39 +464,50 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM",
     )
 
-    # Qwen3.5-MoE (ornith-ai/Ornith-1.0-35B) - text-only bridge on a 1x4 Blackhole ring.
-    # The checkpoint is the hybrid Qwen3.5-MoE text decoder (10 paged-KV full-attention layers, 30
-    # gated-DeltaNet recurrent layers) plus a vision tower the TT port does not implement, so the
-    # adapter is text-only and does not declare SupportsMultiModal.
+    # Qwen3.5-MoE (ornith-ai/Ornith-1.0-35B) - text-only bridge on a
+    # 1x4 Blackhole ring. The checkpoint is the hybrid Qwen3.5-MoE text decoder
+    # (10 paged-KV full-attention layers, 30 gated-DeltaNet recurrent layers)
+    # plus a vision tower the TT port does not implement, so the adapter is
+    # text-only and does not declare SupportsMultiModal.
     #
-    # The plain HF arch is registered too, and it *replaces* upstream's class. Everything
-    # ``ModelConfig`` decides before ``check_and_update_config`` prepends ``TT`` is decided from the
-    # class it resolves then, and for this checkpoint upstream's class makes two decisions that are
-    # wrong for the TT port:
+    # The plain HF arch is registered too, and it *replaces* upstream's class.
+    # Everything ``ModelConfig`` decides before ``check_and_update_config``
+    # prepends ``TT`` is decided from the class it resolves then, and for this
+    # checkpoint upstream's class makes two decisions that are wrong for the
+    # TT port:
     #
-    #   * it is multimodal, so ``multimodal_config`` is populated and ``MultiModalRegistry`` later
-    #     asserts a ``_processor_factory`` on the resolved *TT* class (the same nested-config trap the
-    #     Gemma4 block below documents);
-    #   * it is ``IsHybrid``, so ``verify_and_update_config`` raises ``cache_config.block_size`` until
-    #     an attention page holds a whole GDN state (1072 tokens here) -- a GPU-side constraint about
-    #     sharing one tensor pool. The TT port keeps its recurrent state inside the model, so its paged
-    #     attention blocks are its own 64-token blocks and a rewritten block size simply does not
-    #     match the cache it allocates.
+    #   * it is multimodal, so ``multimodal_config`` is populated and
+    #     ``MultiModalRegistry`` later asserts a ``_processor_factory`` on the
+    #     resolved *TT* class (the same nested-config trap the Gemma4 block
+    #     below documents);
+    #   * it is ``IsHybrid``, so ``verify_and_update_config`` raises
+    #     ``cache_config.block_size`` until an attention page holds a whole GDN
+    #     state (1072 tokens here) -- a GPU-side constraint about sharing one
+    #     tensor pool. The TT port keeps its recurrent state inside the model,
+    #     so its paged attention blocks are its own 64-token blocks and a
+    #     rewritten block size simply does not match the cache it allocates.
     #
-    # Replacing the arch is safe in this process: the TT platform is selected only when ttnn is
-    # importable, and upstream's CUDA implementation cannot serve the checkpoint there. The TT adapter
-    # carries the small vLLM-model interface the registry introspects (see its module docstring).
+    # Replacing the arch is safe in this process: the TT platform is selected
+    # only when ttnn is importable, and upstream's CUDA implementation cannot
+    # serve the checkpoint there. The TT adapter carries the small vLLM-model
+    # interface the registry introspects (see its module docstring).
     _ornith_target = (
-        "models.autoports.ornith_ai_ornith_1_0_35b.tt.generator_vllm:TTQwen3_5MoeForConditionalGeneration"
+        "models.autoports.ornith_ai_ornith_1_0_35b.tt.generator_vllm:"
+        "TTQwen3_5MoeForConditionalGeneration"
     )
-    _register_model_if_missing(ModelRegistry, "TTQwen3_5MoeForConditionalGeneration", _ornith_target)
-    # Unscoped by construction: this replaces the architecture, not one checkpoint, so every
-    # Qwen3.5-MoE checkpoint served by a TT process resolves to the Ornith-1.0-35B port. Registration
-    # runs at plugin-import time, before any model config exists, so there is nothing here to scope it
-    # against. A foreign checkpoint of that architecture therefore fails loudly inside the port (its
-    # config parser refuses unknown `layer_types`, its loader refuses weights that do not nest under
-    # `model.language_model.`) and the adapter warns as it loads; it does not fall back to upstream. If
-    # a second TT port of this architecture ever lands, this line is the collision to resolve.
+    _register_model_if_missing(
+        ModelRegistry, "TTQwen3_5MoeForConditionalGeneration", _ornith_target
+    )
+    # Unscoped by construction: this replaces the architecture, not one
+    # checkpoint, so every Qwen3.5-MoE checkpoint served by a TT process
+    # resolves to the Ornith-1.0-35B port. Registration runs at plugin-import
+    # time, before any model config exists, so there is nothing here to scope
+    # it against. A foreign checkpoint of that architecture therefore fails
+    # loudly inside the port (its config parser refuses unknown `layer_types`,
+    # its loader refuses weights that do not nest under `model.language_model.`)
+    # and the adapter warns as it loads; it does not fall back to upstream. If
+    # a second TT port of this architecture ever lands, this line is the
+    # collision to resolve.
     ModelRegistry.register_model("Qwen3_5MoeForConditionalGeneration", _ornith_target)
 
     # Qwen2.5 - Vision
@@ -695,10 +719,7 @@ class TTPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
         parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
-        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
-        parallel_config.dp_engine_core_proc_cls = (
-            "vllm_tt_plugin.engine.TTDPEngineCoreProc"
-        )
+        _set_tt_engine_core_proc_classes(parallel_config)
         parallel_config.engine_core_launcher_cls = (
             "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
         )

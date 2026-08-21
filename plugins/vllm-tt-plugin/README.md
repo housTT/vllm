@@ -273,7 +273,7 @@ Common options:
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
-| `input_queue_batching_delay` | Event-driven input-queue coalescing timeout in seconds. Default: `0.250` for grouped Qwen3.5-MoE prefills; `0.002` otherwise. |
+| `input_queue_batching_delay` | Event-driven input-queue coalescing timeout in seconds. Grouped Qwen3.5-MoE prefills default to `0.250`; other single-engine models retain upstream queue behavior unless this key is set. Gathered-DP polling defaults to `0.002`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 | `rank_binding` | Rank-binding YAML used for `tt-run` / MPI launches. |
@@ -291,7 +291,7 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | vLLM config field | TT implementation |
 | --- | --- |
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
-| `parallel_config.engine_core_cls` | `vllm_tt_plugin.engine.TTEngineCore` |
+| `parallel_config.engine_core_cls` | `vllm.v1.engine.core.EngineCore` |
 | `parallel_config.engine_core_proc_cls` | `vllm_tt_plugin.engine.TTEngineCoreProc` |
 | `parallel_config.dp_engine_core_proc_cls` | `vllm_tt_plugin.engine.TTDPEngineCoreProc` |
 | `parallel_config.engine_core_launcher_cls` | `vllm_tt_plugin.launcher.TTCoreEngineLauncher` |

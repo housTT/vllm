@@ -61,9 +61,11 @@ def _get_input_queue_batching_delay(vllm_config: VllmConfig) -> float:
     batch, but tokenization can deliver otherwise-concurrent requests to the
     engine several milliseconds apart. Give that model a wider default
     coalescing window only when both scheduler limits permit grouped prefills.
-    B1 configurations and other model families retain the historical 2 ms
-    default. A user-provided TT setting is always authoritative, including
-    zero to disable the delay.
+    The gathered-DP handler retains its historical 2 ms default for B1 and
+    other model families. The single-engine handler uses this resolver only
+    for grouped Ornith or when the user explicitly supplies the TT setting.
+    A user-provided value is always authoritative, including zero to disable
+    the delay.
     """
     tt_config = get_tt_config(vllm_config)
     if "input_queue_batching_delay" in tt_config:
@@ -123,6 +125,151 @@ class DPGatherHandle:
     req_id_to_index: dict[str, int]
 
 
+def _process_tt_input_queue(
+    engine_core: EngineCoreProc,
+    *,
+    poll_idle_queue: bool,
+) -> None:
+    """Process TT client input and coalesce an idle prefill wave.
+
+    ``EngineCoreProc`` normally blocks until the first request and then drains
+    only messages that have already reached its input queue.  That is too
+    early for grouped Ornith prefills: concurrent HTTP requests can finish
+    tokenization a few milliseconds apart, after the first hardware step has
+    already started.  This helper retains each engine's idle behavior, then
+    uses an event-driven, absolute coalescing deadline once a request is
+    scheduler-visible.
+
+    Gathered-DP ranks must periodically leave the idle queue to progress
+    collectives, whereas a single engine can preserve the base class's
+    indefinite idle wait.  ``poll_idle_queue`` selects only that distinction;
+    FIFO draining and coalescing are shared by both paths.
+    """
+    delay = _get_input_queue_batching_delay(engine_core.vllm_config)
+    grouped_target = _get_grouped_ornith_prefill_target(engine_core.vllm_config)
+    waited = False
+
+    if poll_idle_queue:
+        idle_timed_out = False
+        # Before a request is scheduler-visible, retain the historical 2 ms
+        # DP polling cadence. The wider grouped deadline starts only after a
+        # request exists and therefore cannot park otherwise-idle peer ranks.
+        idle_timeout = min(max(delay, 0.0), _DEFAULT_INPUT_QUEUE_BATCHING_DELAY)
+        idle_deadline = time.monotonic() + idle_timeout
+        while (
+            not engine_core.engines_running
+            and not engine_core.scheduler.has_requests()
+            and not engine_core.batch_queue
+            and not getattr(engine_core, "_dp_in_flight", None)
+            and not engine_core._scheduler_paused
+        ):
+            # A bounded blocking read wakes immediately on arrival while idle
+            # TT ranks still return to the gathered-DP collective loop.
+            try:
+                if idle_timeout > 0:
+                    remaining = idle_deadline - time.monotonic()
+                    if remaining <= 0:
+                        idle_timed_out = True
+                        break
+                    req = engine_core.input_queue.get(timeout=remaining)
+                else:
+                    req = engine_core.input_queue.get_nowait()
+                engine_core._handle_client_request(*req)
+                waited = True
+            except queue.Empty:
+                idle_timed_out = True
+                break
+
+        if idle_timed_out:
+            if waited:
+                logger.debug("EngineCore loop active.")
+            return
+    else:
+        # Preserve EngineCoreProc's idle semantics for DP=1, including abort
+        # queue cleanup and an indefinite blocking read before the first
+        # scheduler-visible request.
+        while (
+            not engine_core.engines_running
+            and not engine_core.scheduler.has_requests()
+            and not engine_core.batch_queue
+            and not engine_core._scheduler_paused
+        ):
+            if engine_core.input_queue.empty():
+                with engine_core.aborts_queue.mutex:
+                    engine_core.aborts_queue.queue.clear()
+                logger.debug("EngineCore waiting for work.")
+                waited = True
+            req = engine_core.input_queue.get()
+            engine_core._handle_client_request(*req)
+
+    if waited:
+        logger.debug("EngineCore loop active.")
+
+    # Use one absolute deadline for the whole coalescing phase. Arrivals wake
+    # the queue read immediately, but request/control-message trickle cannot
+    # extend the batching window indefinitely.
+    coalescing_deadline = time.monotonic() + max(delay, 0.0)
+    max_num_seqs = int(engine_core.vllm_config.scheduler_config.max_num_seqs)
+    while True:
+        num_running, num_waiting = engine_core.scheduler.get_request_counts()
+        coalescing_target = (
+            grouped_target if grouped_target is not None else max_num_seqs
+        )
+        target_reached = num_waiting >= coalescing_target
+        has_pending_engine_work = bool(
+            engine_core.engines_running
+            or engine_core.batch_queue
+            or getattr(engine_core, "_dp_in_flight", None)
+            or engine_core._scheduler_paused
+        )
+        should_wait = (
+            delay > 0
+            and num_waiting > 0
+            and num_running == 0
+            and not target_reached
+            and not has_pending_engine_work
+        )
+        try:
+            if should_wait:
+                remaining = coalescing_deadline - time.monotonic()
+                if remaining > 0:
+                    try:
+                        req = engine_core.input_queue.get(timeout=remaining)
+                    except queue.Empty:
+                        # Close the timeout boundary race: an abort, executor
+                        # failure, or request may have arrived as the blocking
+                        # read expired. Drain it below before a hardware step.
+                        req = engine_core.input_queue.get_nowait()
+                else:
+                    # The deadline stops further blocking, not FIFO handling
+                    # of messages that are already queued.
+                    req = engine_core.input_queue.get_nowait()
+            else:
+                # Never wait once the target is full or other engine work is
+                # active, but drain all messages already queued in FIFO order.
+                req = engine_core.input_queue.get_nowait()
+        except queue.Empty:
+            break
+        engine_core._handle_client_request(*req)
+
+
+class TTEngineCoreProc(EngineCoreProc):
+    """TT single-engine core with opt-in or grouped-prefill coalescing."""
+
+    def _process_input_queue(self) -> None:
+        tt_config = get_tt_config(self.vllm_config)
+        grouped_ornith = (
+            _get_grouped_ornith_prefill_target(self.vllm_config) is not None
+        )
+        if grouped_ornith or "input_queue_batching_delay" in tt_config:
+            _process_tt_input_queue(self, poll_idle_queue=False)
+        else:
+            # Do not introduce a queue delay for unrelated DP=1 models. Their
+            # established behavior is the upstream blocking/draining loop;
+            # users can explicitly opt in through the TT config key above.
+            EngineCoreProc._process_input_queue(self)
+
+
 class TTDPEngineCoreProc(DPEngineCoreProc):
     """TT data-parallel engine core with gathered-batch orchestration."""
 
@@ -146,92 +293,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             self.step_fn = self.step_dp_with_batch_queue
 
     def _process_input_queue(self) -> None:
-        delay = _get_input_queue_batching_delay(self.vllm_config)
-        grouped_target = _get_grouped_ornith_prefill_target(self.vllm_config)
-        waited = False
-        idle_timed_out = False
-        # Before a request is scheduler-visible, retain the historical 2 ms
-        # DP polling cadence. The wider grouped deadline starts only after a
-        # request exists and therefore cannot park otherwise-idle peer ranks.
-        idle_timeout = min(max(delay, 0.0), _DEFAULT_INPUT_QUEUE_BATCHING_DELAY)
-        idle_deadline = time.monotonic() + idle_timeout
-        while (
-            not self.engines_running
-            and not self.scheduler.has_requests()
-            and not self.batch_queue
-            and not self._dp_in_flight
-            and not self._scheduler_paused
-        ):
-            # Idle TT ranks must keep progressing collectives, so do not block
-            # indefinitely waiting for client input. A bounded blocking read
-            # wakes immediately on arrival without polling sleeps.
-            try:
-                if idle_timeout > 0:
-                    remaining = idle_deadline - time.monotonic()
-                    if remaining <= 0:
-                        idle_timed_out = True
-                        break
-                    req = self.input_queue.get(timeout=remaining)
-                else:
-                    req = self.input_queue.get_nowait()
-                self._handle_client_request(*req)
-                waited = True
-            except queue.Empty:
-                idle_timed_out = True
-                break
-
-        if waited:
-            logger.debug("EngineCore loop active.")
-        if idle_timed_out:
-            return
-
-        # Use one absolute deadline for the whole coalescing phase. Arrivals
-        # wake the queue read immediately, but request/control-message trickle
-        # cannot extend the batching window indefinitely.
-        coalescing_deadline = time.monotonic() + max(delay, 0.0)
-        max_num_seqs = int(self.vllm_config.scheduler_config.max_num_seqs)
-        while True:
-            num_running, num_waiting = self.scheduler.get_request_counts()
-            has_running = num_running > 0
-            coalescing_target = (
-                grouped_target if grouped_target is not None else max_num_seqs
-            )
-            target_reached = num_waiting >= coalescing_target
-            should_wait = (
-                delay > 0
-                and num_waiting > 0
-                and not has_running
-                and not target_reached
-                and not self.batch_queue
-                and not self._dp_in_flight
-                and not self._scheduler_paused
-            )
-            try:
-                if should_wait:
-                    remaining = coalescing_deadline - time.monotonic()
-                    if remaining > 0:
-                        try:
-                            req = self.input_queue.get(timeout=remaining)
-                        except queue.Empty:
-                            # Close the timeout boundary race: an abort,
-                            # executor failure, or request may have arrived as
-                            # the blocking read expired. Drain it below before
-                            # allowing a hardware step to start.
-                            req = self.input_queue.get_nowait()
-                    else:
-                        # The deadline stops further blocking, not FIFO
-                        # processing of messages that are already queued.
-                        req = self.input_queue.get_nowait()
-                else:
-                    # Preserve FIFO handling for requests and control messages
-                    # that have already arrived, but never wait when the
-                    # grouped target is full or this rank has other work. This
-                    # also keeps empty active-wave DP ranks moving toward the
-                    # next collective instead of parking them for 250 ms.
-                    req = self.input_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_client_request(*req)
+        _process_tt_input_queue(self, poll_idle_queue=True)
 
     def _init_tt_dp_group(self, parallel_config: ParallelConfig) -> None:
         self.dp_group = _normal_init_dp_group(parallel_config)

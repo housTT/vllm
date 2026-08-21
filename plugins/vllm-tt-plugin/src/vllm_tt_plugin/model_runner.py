@@ -871,14 +871,38 @@ class TTModelRunner:
             "slots; admission is the scheduler's job, not this function's"
         )
         prefilling = set(row_req_ids)
-        held = {
+        off_batch_held = {
             slot
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        existing_by_req = {
+            req_id: self._req_state_slot[req_id]
+            for req_id in row_req_ids
+            if req_id in self._req_state_slot
+        }
+        existing_slots = list(existing_by_req.values())
+        assert len(set(existing_slots)) == len(existing_slots) and all(
+            0 <= slot < n_slots for slot in existing_slots
+        ), f"prefilling requests have invalid existing slots: {existing_by_req}"
+        collisions = set(existing_slots) & off_batch_held
+        assert not collisions, (
+            f"prefilling and off-batch requests both own slot(s) {sorted(collisions)}: "
+            f"map={self._req_state_slot}"
+        )
+        # Reserve every continuation's slot before assigning any fresh request. Otherwise a fresh
+        # row processed first could take a later continuation's authoritative state slot.
+        held = off_batch_held | set(existing_slots)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            existing = existing_by_req.get(req_id)
+            if existing is not None:
+                # A chunked-prefill continuation already owns authoritative recurrent state. Keep
+                # that slot even if a lower row became free while it was paused; silently moving the
+                # host mapping would make the model restore a different request's state. Fresh and
+                # preempted requests have no mapping and still prefer their row below.
+                slot = existing
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]

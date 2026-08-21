@@ -93,6 +93,58 @@ _UNBOUNDED_PROMPT_LEN = 1 << 62
 # (unchanged here) alongside mean TPOT, never mean TPOT alone.
 DEFAULT_PREFILL_CAP_MAX_PROMPT_LEN = _UNBOUNDED_PROMPT_LEN
 
+# Model types whose TT implementation can restore a partial prefill's recurrent state after another
+# request or a decode step used the device. Restricting this separately from platform.py's chunked
+# prefill allow-list is intentional: splitting a prompt and *interleaving* its chunks are distinct
+# statefulness contracts. The environment override exists for controlled A/Bs and emergency rollback.
+_INTERLEAVED_PREFILL_MODEL_TYPES = {"qwen3_5_moe"}
+_INTERLEAVE_ENV = "TT_INTERLEAVE_PREFILL_CHUNKS"
+
+
+def _resolve_chunk_interleave(vllm_config) -> bool:
+    scheduler_config = vllm_config.scheduler_config
+    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    default = bool(
+        scheduler_config.enable_chunked_prefill
+        and model_type in _INTERLEAVED_PREFILL_MODEL_TYPES
+    )
+    raw = os.getenv(_INTERLEAVE_ENV)
+    if raw is None:
+        enabled = default
+    else:
+        text = raw.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            enabled = True
+        elif text in ("0", "false", "no", "off"):
+            enabled = False
+        else:
+            raise ValueError(
+                f"{_INTERLEAVE_ENV} must be a boolean (0/1, false/true, off/on), got {raw!r}"
+            )
+    if enabled and not scheduler_config.enable_chunked_prefill:
+        raise ValueError(
+            f"{_INTERLEAVE_ENV}=1 requires enable_chunked_prefill=True; there are no chunks to interleave"
+        )
+    partial_limit = int(getattr(scheduler_config, "max_num_partial_prefills", 1))
+    if enabled and partial_limit != 1:
+        raise ValueError(
+            "interleaved TT prefill uses one shared batch-1 recurrent-state pack and therefore "
+            f"requires max_num_partial_prefills=1, got {partial_limit}"
+        )
+    return enabled
+
+
+def _validate_chunk_interleave_admission(policy: "_PrefillCapPolicy") -> None:
+    """Require one admitted prefill while a single batch-1 pack is the paused-state authority."""
+    always_one = policy.cap == 1 and (
+        policy.explicit or policy.max_prompt_len >= _UNBOUNDED_PROMPT_LEN
+    )
+    if not always_one:
+        raise ValueError(
+            "interleaved TT prefill requires max_prefills_per_step=1 with no prompt-length gate; "
+            "set TT_INTERLEAVE_PREFILL_CHUNKS=0 before using a different admission policy"
+        )
+
 
 @dataclass(frozen=True)
 class _PrefillCapPolicy:
@@ -339,12 +391,24 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._prefill_cap = resolve_prefill_cap_policy(self.vllm_config)
+        self._interleave_prefill_chunks = _resolve_chunk_interleave(self.vllm_config)
+        if self._interleave_prefill_chunks:
+            _validate_chunk_interleave_admission(self._prefill_cap)
+        # Set after a scheduler step executes either a non-final chunk or the final continuation of
+        # an already chunked prompt. If decode work is live, the next default-mode step pays that debt
+        # before another prefill chunk, bounding a decoder's stall to one chunk at a time.
+        self._decode_due_after_prefill_chunk = False
         # Last automatic decision, so a step with nothing new to admit (a
         # partial-prefill continuation on its own) keeps the wave's decision
         # rather than silently flipping, and so a flip can be logged when it
         # actually happens.
         self._auto_cap_active: bool | None = None
         logger.info(f"TT prefill admission: {self._prefill_cap.describe()}")
+        logger.info(
+            "TT prefill/decode chunk interleave: %s%s",
+            "enabled" if self._interleave_prefill_chunks else "disabled",
+            f" ({_INTERLEAVE_ENV})" if os.getenv(_INTERLEAVE_ENV) is not None else "",
+        )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -364,15 +428,19 @@ class TTScheduler(AsyncScheduler):
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
-            result = self._schedule_prefill_only()
+            result = self._schedule_prefill_with_interleave_tracking()
             return self._finalize_scheduler_output(result)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_pending_prefill:
                 # Hide waiting and partial-prefill continuations.
                 result = self._schedule_decode_only()
+                if result.total_num_scheduled_tokens:
+                    self._decode_due_after_prefill_chunk = False
                 return self._finalize_scheduler_output(result)
             # No pending prefill: base scheduler naturally runs decode-only.
             result = super().schedule()
+            if result.total_num_scheduled_tokens:
+                self._decode_due_after_prefill_chunk = False
             return self._finalize_scheduler_output(result)
 
         # Default mode:
@@ -380,18 +448,52 @@ class TTScheduler(AsyncScheduler):
         # requests in the waiting queue or partial-prefill continuations in
         # the running list.
         if has_pending_prefill:
-            prefill_result = self._schedule_prefill_only()
+            if (
+                self._interleave_prefill_chunks
+                and self._decode_due_after_prefill_chunk
+                and has_running
+            ):
+                decode_result = self._schedule_decode_only()
+                if decode_result.total_num_scheduled_tokens:
+                    self._decode_due_after_prefill_chunk = False
+                    return self._finalize_scheduler_output(decode_result)
+
+            prefill_result = self._schedule_prefill_with_interleave_tracking()
             # If prefill cannot make progress (e.g., KV pressure) but running
             # decode requests exist, fall back to decode-only so they can
             # advance and free capacity.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running:
                 result = self._schedule_decode_only()
+                if result.total_num_scheduled_tokens:
+                    self._decode_due_after_prefill_chunk = False
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
         # No pending prefill work: run decode-only naturally.
         result = super().schedule()
+        if result.total_num_scheduled_tokens:
+            self._decode_due_after_prefill_chunk = False
         return self._finalize_scheduler_output(result)
+
+    def _schedule_prefill_with_interleave_tracking(self) -> SchedulerOutput:
+        """Schedule one pure-prefill step and remember whether a decode step is now due.
+
+        Looking both before and after scheduling handles the two boundary cases. A newly admitted
+        long prompt is marked partial only *after* its first chunk is scheduled; the final chunk of a
+        continuation is partial only *before* it is scheduled. Either one must be followed by decode
+        when other requests are already generating, otherwise two adjacent chunks can recreate the
+        multi-second streaming stall this policy exists to remove.
+        """
+        had_partial = any(request.is_prefill_chunk for request in self.running)
+        result = self._schedule_prefill_only()
+        has_partial = any(request.is_prefill_chunk for request in self.running)
+        if (
+            self._interleave_prefill_chunks
+            and result.total_num_scheduled_tokens
+            and (had_partial or has_partial)
+        ):
+            self._decode_due_after_prefill_chunk = True
+        return result
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
@@ -500,9 +602,15 @@ class TTScheduler(AsyncScheduler):
 
         saved_max = self.max_num_running_reqs
         prefill_capacity = max(0, saved_max - len(pure_decodes))
-        cap = self._effective_prefill_cap()
-        if cap is not None:
-            prefill_capacity = max(len(partial_prefills), min(prefill_capacity, cap))
+        if self._interleave_prefill_chunks and partial_prefills:
+            # A partial Ornith request owns the model's one batch-1 prefill pack while decode runs.
+            # Do not admit a second prefill that would replace that authority before the continuation
+            # has consumed it. This remains one even if an operator raises max_prefills_per_step.
+            prefill_capacity = len(partial_prefills)
+        else:
+            cap = self._effective_prefill_cap()
+            if cap is not None:
+                prefill_capacity = max(len(partial_prefills), min(prefill_capacity, cap))
         self.running = partial_prefills
         self.max_num_running_reqs = prefill_capacity
         try:

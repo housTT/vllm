@@ -133,6 +133,22 @@ def test_release_keeps_a_merely_unscheduled_request():
     assert r._req_state_slot == {"B": 1}
 
 
+def test_a_partial_prefill_keeps_its_existing_slot_when_a_lower_row_becomes_free():
+    """Continuation state is already stored; front-packing must not silently retarget it."""
+    r = _runner()
+    assert _prefill(r, ["holder", "partial"]) == [0, 1]
+    _release(r, finished={"holder"})
+    r.requests.pop("holder")
+
+    assert _prefill(r, ["partial"]) == [1]
+    assert r._req_state_slot["partial"] == 1
+
+    # Pre-reservation matters when a fresh request appears earlier in the same front-packed input:
+    # it may take a free row, but never the later continuation's existing slot.
+    assert _prefill(r, ["fresh", "partial"]) == [0, 1]
+    assert r._req_state_slot == {"partial": 1, "fresh": 0}
+
+
 def test_preemption_frees_the_slot_a_later_prefill_needs():
     """A preempted request's state is dead: ``_preempt_request`` freed its KV and reset
     ``num_computed_tokens``, so the resume re-prefills from zero and rewrites the slot.

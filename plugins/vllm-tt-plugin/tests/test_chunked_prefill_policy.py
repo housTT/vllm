@@ -4,6 +4,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 # Importing the platform module reenters vLLM's platform-plugin bootstrap, which
 # resolves against a half-built ``vllm`` and fails unless vLLM has already
 # finished importing itself. This import has to stay first.
@@ -51,6 +53,38 @@ def test_unified_gemma4_checkpoint_also_keeps_chunked_prefill():
     _apply_chunked_prefill_policy(config)
 
     assert config.scheduler_config.enable_chunked_prefill is True
+
+
+@pytest.mark.parametrize("starting_budget", [512, 1024, 2048, 262144])
+def test_ornith_qwen3_5_moe_pins_exact_model_chunk_boundaries(starting_budget):
+    config = _vllm_config(
+        model_type="qwen3_5_moe",
+        max_num_batched_tokens=starting_budget,
+        long_prefill_token_threshold=512,
+    )
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is True
+    assert config.scheduler_config.max_num_batched_tokens == 2048
+    assert config.scheduler_config.long_prefill_token_threshold == 0
+    assert config.scheduler_config.disable_chunked_mm_input is True
+
+
+@pytest.mark.parametrize("starting_budget, expected_budget", [(2048, 16384), (32768, 32768)])
+def test_ornith_without_chunking_can_admit_a_full_prompt(starting_budget, expected_budget):
+    config = _vllm_config(
+        model_type="qwen3_5_moe",
+        enable_chunked_prefill=False,
+        max_num_batched_tokens=starting_budget,
+        max_model_len=16384,
+    )
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is False
+    assert config.scheduler_config.max_num_batched_tokens == expected_budget
+    assert config.scheduler_config.long_prefill_token_threshold == 0
 
 
 def test_other_model_type_loses_chunked_prefill_and_gets_a_full_prompt_budget():

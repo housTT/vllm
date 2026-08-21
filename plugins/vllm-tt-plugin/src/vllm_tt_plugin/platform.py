@@ -42,8 +42,11 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
-# TT model types that have been validated with real chunked prefill.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+# TT model types that have been validated with real chunked prefill. Qwen3.5-MoE resolves to the
+# Ornith text adapter registered below; that adapter preserves recurrent DeltaNet state across
+# scheduler chunks in its single-request prefill pack, restoring from the persistent serving slot
+# only when another request has replaced that pack.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified", "qwen3_5_moe"}
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
@@ -58,6 +61,29 @@ def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
         # vLLM rejects the flag outright when one item exceeds the token budget,
         # so it stays off for every model type below.
         scheduler_config.disable_chunked_mm_input = True
+        if model_type == "qwen3_5_moe" and scheduler_config.enable_chunked_prefill:
+            # Ornith's DeltaNet continuation requires every start position to be a multiple of its
+            # compiled 2048-token prefill block. A smaller scheduler budget produces an illegal next
+            # start (e.g. 1024); a larger one hides multiple model blocks inside one scheduler step
+            # and prevents decode from running between them. Pin both knobs, including configurations
+            # previously expanded to max_model_len while this model was not on the allow-list.
+            if scheduler_config.max_num_batched_tokens != 2048:
+                logger.info(
+                    "Ornith chunked prefill requires 2048-token scheduler boundaries; "
+                    "overriding max_num_batched_tokens=%d.",
+                    scheduler_config.max_num_batched_tokens,
+                )
+            scheduler_config.max_num_batched_tokens = 2048
+            scheduler_config.long_prefill_token_threshold = 0
+        elif model_type == "qwen3_5_moe":
+            # Without scheduler chunking the base scheduler must admit the whole prompt in one
+            # step. Keeping the 2048 boundary pin here would therefore strand every longer prompt,
+            # including lengths inside Ornith's advertised 262144-token context.
+            scheduler_config.max_num_batched_tokens = max(
+                scheduler_config.max_num_batched_tokens,
+                model_config.max_model_len,
+            )
+            scheduler_config.long_prefill_token_threshold = 0
         return
 
     if scheduler_config.enable_chunked_prefill:

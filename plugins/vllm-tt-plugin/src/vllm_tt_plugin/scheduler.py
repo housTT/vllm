@@ -17,15 +17,10 @@ logger = init_tt_logger(__name__)
 
 # ---------------------------------------------------------------- prefill admission cap
 #
-# How many requests one prefill step may carry. TT prefill is a *sequential* loop
-# over the batch on the model side (one ``prefill_request_into_slot`` call per
-# request), so a step that admits N requests costs N x T either way -- but vLLM
-# publishes a step's sampled tokens only when the step returns, so all N first
-# tokens are withheld until the last request's prefill finishes. Admitting one
-# request per step releases each first token as soon as its own prefill completes:
-# for a wave of N arriving together, mean TTFT drops from N x T to (N + 1) / 2 x T.
-# Nothing about the computation changes -- same per-request prefill call, same
-# state slot (see ``_schedule_prefill_only``).
+# How many synchronized requests one Ornith prefill step may carry. The model has real B=2/B=4
+# device paths, so four equal-length requests consume one 4x2048 global scheduler budget and one
+# model invocation. Admission below restricts a partial-prefill group to the same total prompt
+# length, which keeps every start/tail synchronized across all later chunks.
 #
 # It is not free, and the cost grows with prompt length. The model's
 # ``_ensure_traces_replay_safe`` runs at every prefill-step entry and re-captures
@@ -48,7 +43,7 @@ logger = init_tt_logger(__name__)
 # waiting request, which is the behaviour before this cap existed.
 _PREFILL_CAP_ENV = "TT_MAX_PREFILLS_PER_STEP"
 _PREFILL_CAP_KEY = "max_prefills_per_step"
-DEFAULT_MAX_PREFILLS_PER_STEP = 1
+DEFAULT_MAX_PREFILLS_PER_STEP = 4
 
 _PREFILL_CAP_LEN_ENV = "TT_PREFILL_CAP_MAX_PROMPT_LEN"
 _PREFILL_CAP_LEN_KEY = "prefill_cap_max_prompt_len"
@@ -126,23 +121,23 @@ def _resolve_chunk_interleave(vllm_config) -> bool:
             f"{_INTERLEAVE_ENV}=1 requires enable_chunked_prefill=True; there are no chunks to interleave"
         )
     partial_limit = int(getattr(scheduler_config, "max_num_partial_prefills", 1))
-    if enabled and partial_limit != 1:
+    if enabled and not 1 <= partial_limit <= 4:
         raise ValueError(
-            "interleaved TT prefill uses one shared batch-1 recurrent-state pack and therefore "
-            f"requires max_num_partial_prefills=1, got {partial_limit}"
+            "interleaved Ornith prefill has persistent B=1/B=2/B=4 recurrent-state packs and "
+            f"requires max_num_partial_prefills in [1, 4], got {partial_limit}"
         )
     return enabled
 
 
 def _validate_chunk_interleave_admission(policy: "_PrefillCapPolicy") -> None:
-    """Require one admitted prefill while a single batch-1 pack is the paused-state authority."""
-    always_one = policy.cap == 1 and (
+    """Require one bounded synchronized group while prefill packs are paused-state authorities."""
+    bounded_group = policy.cap is not None and 1 <= policy.cap <= 4 and (
         policy.explicit or policy.max_prompt_len >= _UNBOUNDED_PROMPT_LEN
     )
-    if not always_one:
+    if not bounded_group:
         raise ValueError(
-            "interleaved TT prefill requires max_prefills_per_step=1 with no prompt-length gate; "
-            "set TT_INTERLEAVE_PREFILL_CHUNKS=0 before using a different admission policy"
+            "interleaved Ornith prefill requires max_prefills_per_step in [1, 4] with no "
+            "prompt-length gate; set TT_INTERLEAVE_PREFILL_CHUNKS=0 before using a different policy"
         )
 
 
@@ -563,6 +558,33 @@ class TTScheduler(AsyncScheduler):
             self._auto_cap_active = active
         return policy.cap if active else None
 
+    def _synchronized_waiting_prefix(self, limit: int) -> int:
+        """Length of the FCFS prefix that can share one persistent prefill-pack wave.
+
+        Equal total token count and equal computed position make the first chunk, every 2048-token
+        continuation, and the final tail identical.  Stop at the first mismatch instead of skipping
+        it: admission order remains the queue policy's order. Prefix caching is not supported by the
+        Ornith adapter, but including ``num_computed_tokens`` makes that invariant explicit and
+        keeps a resumed request from being grouped with a fresh one accidentally.
+        """
+
+        limit = max(0, int(limit))
+        expected = None
+        count = 0
+        for request in self.waiting:
+            if count >= limit:
+                break
+            key = (
+                int(getattr(request, "num_computed_tokens", 0)),
+                int(getattr(request, "num_tokens", request.num_prompt_tokens)),
+            )
+            if expected is None:
+                expected = key
+            elif key != expected:
+                break
+            count += 1
+        return count
+
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests + partial-prefill continuations.
 
@@ -603,14 +625,19 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         prefill_capacity = max(0, saved_max - len(pure_decodes))
         if self._interleave_prefill_chunks and partial_prefills:
-            # A partial Ornith request owns the model's one batch-1 prefill pack while decode runs.
-            # Do not admit a second prefill that would replace that authority before the continuation
-            # has consumed it. This remains one even if an operator raises max_prefills_per_step.
+            # The existing synchronized group owns its persistent prefill packs while decode runs.
+            # Admit nothing new until every member has consumed the continuation; mixing start=0
+            # rows into the group would overwrite that authority.
             prefill_capacity = len(partial_prefills)
         else:
             cap = self._effective_prefill_cap()
             if cap is not None:
                 prefill_capacity = max(len(partial_prefills), min(prefill_capacity, cap))
+            if self._interleave_prefill_chunks and not partial_prefills and prefill_capacity:
+                prefill_capacity = min(
+                    prefill_capacity,
+                    self._synchronized_waiting_prefix(prefill_capacity),
+                )
         self.running = partial_prefills
         self.max_num_running_reqs = prefill_capacity
         try:

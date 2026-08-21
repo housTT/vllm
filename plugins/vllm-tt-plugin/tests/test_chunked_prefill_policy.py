@@ -27,6 +27,8 @@ def _vllm_config(
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_batched_tokens=max_num_batched_tokens,
             long_prefill_token_threshold=long_prefill_token_threshold,
+            max_num_partial_prefills=1,
+            max_long_partial_prefills=1,
             disable_chunked_mm_input=False,
         ),
         model_config=SimpleNamespace(
@@ -66,8 +68,10 @@ def test_ornith_qwen3_5_moe_pins_exact_model_chunk_boundaries(starting_budget):
     _apply_chunked_prefill_policy(config)
 
     assert config.scheduler_config.enable_chunked_prefill is True
-    assert config.scheduler_config.max_num_batched_tokens == 2048
-    assert config.scheduler_config.long_prefill_token_threshold == 0
+    assert config.scheduler_config.max_num_batched_tokens == 8192
+    assert config.scheduler_config.long_prefill_token_threshold == 2048
+    assert config.scheduler_config.max_num_partial_prefills == 4
+    assert config.scheduler_config.max_long_partial_prefills == 4
     assert config.scheduler_config.disable_chunked_mm_input is True
 
 

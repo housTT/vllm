@@ -18,7 +18,7 @@ from vllm_tt_plugin.scheduler import (
 )
 
 
-def _config(*, model_type="qwen3_5_moe", chunked=True, partial_prefills=1):
+def _config(*, model_type="qwen3_5_moe", chunked=True, partial_prefills=4):
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(
             enable_chunked_prefill=chunked,
@@ -47,8 +47,8 @@ def test_interleave_defaults_only_to_the_validated_stateful_model(monkeypatch):
     assert _resolve_chunk_interleave(_config()) is True
     assert _resolve_chunk_interleave(_config(model_type="gemma4")) is False
     assert _resolve_chunk_interleave(_config(chunked=False)) is False
-    with pytest.raises(ValueError, match="max_num_partial_prefills=1"):
-        _resolve_chunk_interleave(_config(partial_prefills=2))
+    with pytest.raises(ValueError, match=r"max_num_partial_prefills in \[1, 4\]"):
+        _resolve_chunk_interleave(_config(partial_prefills=5))
 
 
 def test_interleave_override_is_strict_and_requires_chunking(monkeypatch):
@@ -58,27 +58,49 @@ def test_interleave_override_is_strict_and_requires_chunking(monkeypatch):
     assert _resolve_chunk_interleave(_config(model_type="gemma4")) is True
     with pytest.raises(ValueError, match="requires enable_chunked_prefill"):
         _resolve_chunk_interleave(_config(chunked=False))
-    with pytest.raises(ValueError, match="max_num_partial_prefills=1"):
-        _resolve_chunk_interleave(_config(partial_prefills=2))
+    with pytest.raises(ValueError, match=r"max_num_partial_prefills in \[1, 4\]"):
+        _resolve_chunk_interleave(_config(partial_prefills=5))
     monkeypatch.setenv("TT_INTERLEAVE_PREFILL_CHUNKS", "perhaps")
     with pytest.raises(ValueError, match="must be a boolean"):
         _resolve_chunk_interleave(_config())
 
 
-def test_interleave_requires_exactly_one_prefill_admission_at_every_length():
+def test_interleave_requires_one_bounded_prefill_group_at_every_length():
     _validate_chunk_interleave_admission(
         _PrefillCapPolicy(cap=1, explicit=False, max_prompt_len=1 << 62)
     )
     _validate_chunk_interleave_admission(
-        _PrefillCapPolicy(cap=1, explicit=True, max_prompt_len=0)
+        _PrefillCapPolicy(cap=4, explicit=True, max_prompt_len=0)
     )
     for policy in (
         _PrefillCapPolicy(cap=None, explicit=True, max_prompt_len=1 << 62),
-        _PrefillCapPolicy(cap=2, explicit=True, max_prompt_len=1 << 62),
-        _PrefillCapPolicy(cap=1, explicit=False, max_prompt_len=4096),
+        _PrefillCapPolicy(cap=5, explicit=True, max_prompt_len=1 << 62),
+        _PrefillCapPolicy(cap=4, explicit=False, max_prompt_len=4096),
     ):
-        with pytest.raises(ValueError, match="max_prefills_per_step=1"):
+        with pytest.raises(ValueError, match=r"max_prefills_per_step in \[1, 4\]"):
             _validate_chunk_interleave_admission(policy)
+
+
+def test_fresh_admission_stops_at_the_equal_geometry_prefix():
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.waiting = [
+        SimpleNamespace(num_computed_tokens=0, num_tokens=16384, num_prompt_tokens=16384),
+        SimpleNamespace(num_computed_tokens=0, num_tokens=16384, num_prompt_tokens=16384),
+        SimpleNamespace(num_computed_tokens=0, num_tokens=32768, num_prompt_tokens=32768),
+        SimpleNamespace(num_computed_tokens=0, num_tokens=16384, num_prompt_tokens=16384),
+    ]
+
+    assert TTScheduler._synchronized_waiting_prefix(scheduler, 4) == 2
+
+
+def test_resumed_and_fresh_requests_are_not_grouped_even_at_equal_total_length():
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.waiting = [
+        SimpleNamespace(num_computed_tokens=2048, num_tokens=16384, num_prompt_tokens=16384),
+        SimpleNamespace(num_computed_tokens=0, num_tokens=16384, num_prompt_tokens=16384),
+    ]
+
+    assert TTScheduler._synchronized_waiting_prefix(scheduler, 4) == 1
 
 
 def test_a_due_decode_runs_before_the_next_partial_prefill():

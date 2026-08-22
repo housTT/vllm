@@ -33,6 +33,23 @@ _T = TypeVar("_T")
 
 _DEFAULT_INPUT_QUEUE_BATCHING_DELAY = 0.002
 _ORNITH_GROUPED_INPUT_QUEUE_BATCHING_DELAY = 0.250
+_ORNITH_THROUGHPUT_INPUT_QUEUE_BATCHING_DELAY = 2.000
+_ORNITH_PREFILL_PROFILE_ENV_VAR = "ORNITH_VLLM_PREFILL_PROFILE"
+_ORNITH_PREFILL_PROFILES = ("interactive", "throughput")
+
+
+def _get_ornith_prefill_profile() -> str:
+    """Resolve the live latency/throughput trade-off for grouped Ornith prefills."""
+
+    raw = os.environ.get(_ORNITH_PREFILL_PROFILE_ENV_VAR, "").strip()
+    if not raw:
+        return "interactive"
+    if raw not in _ORNITH_PREFILL_PROFILES:
+        choices = ", ".join(_ORNITH_PREFILL_PROFILES)
+        raise ValueError(
+            f"{_ORNITH_PREFILL_PROFILE_ENV_VAR} must be one of {choices}; got {raw!r}"
+        )
+    return raw
 
 
 def _get_grouped_ornith_prefill_target(vllm_config: VllmConfig) -> int | None:
@@ -72,6 +89,8 @@ def _get_input_queue_batching_delay(vllm_config: VllmConfig) -> float:
         return float(tt_config["input_queue_batching_delay"])
 
     if _get_grouped_ornith_prefill_target(vllm_config) is not None:
+        if _get_ornith_prefill_profile() == "throughput":
+            return _ORNITH_THROUGHPUT_INPUT_QUEUE_BATCHING_DELAY
         return _ORNITH_GROUPED_INPUT_QUEUE_BATCHING_DELAY
     return _DEFAULT_INPUT_QUEUE_BATCHING_DELAY
 
@@ -147,6 +166,11 @@ def _process_tt_input_queue(
     """
     delay = _get_input_queue_batching_delay(engine_core.vllm_config)
     grouped_target = _get_grouped_ornith_prefill_target(engine_core.vllm_config)
+    profile = (
+        _get_ornith_prefill_profile()
+        if grouped_target is not None
+        else "not_applicable"
+    )
     waited = False
 
     if poll_idle_queue:
@@ -208,8 +232,10 @@ def _process_tt_input_queue(
     # Use one absolute deadline for the whole coalescing phase. Arrivals wake
     # the queue read immediately, but request/control-message trickle cannot
     # extend the batching window indefinitely.
-    coalescing_deadline = time.monotonic() + max(delay, 0.0)
+    coalescing_started = time.monotonic()
+    coalescing_deadline = coalescing_started + max(delay, 0.0)
     max_num_seqs = int(engine_core.vllm_config.scheduler_config.max_num_seqs)
+    exit_reason = "queue_drained"
     while True:
         num_running, num_waiting = engine_core.scheduler.get_request_counts()
         coalescing_target = (
@@ -249,8 +275,33 @@ def _process_tt_input_queue(
                 # active, but drain all messages already queued in FIFO order.
                 req = engine_core.input_queue.get_nowait()
         except queue.Empty:
+            if should_wait and time.monotonic() >= coalescing_deadline:
+                exit_reason = "deadline"
+            elif target_reached:
+                exit_reason = "target_reached"
+            elif has_pending_engine_work:
+                exit_reason = "engine_work_pending"
+            elif num_waiting == 0:
+                exit_reason = "no_waiting_requests"
             break
         engine_core._handle_client_request(*req)
+
+    num_running, num_waiting = engine_core.scheduler.get_request_counts()
+    tt_config = get_tt_config(engine_core.vllm_config)
+    if num_waiting > 0 and (
+        grouped_target is not None or "input_queue_batching_delay" in tt_config
+    ):
+        logger.info(
+            "TT prefill coalescing exit profile=%s delay_seconds=%.3f "
+            "elapsed_seconds=%.3f target=%d waiting=%d running=%d reason=%s",
+            profile,
+            delay,
+            time.monotonic() - coalescing_started,
+            grouped_target if grouped_target is not None else max_num_seqs,
+            num_waiting,
+            num_running,
+            exit_reason,
+        )
 
 
 class TTEngineCoreProc(EngineCoreProc):

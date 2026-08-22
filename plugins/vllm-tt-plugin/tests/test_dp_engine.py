@@ -11,6 +11,7 @@ from vllm_tt_plugin.engine import (
     TTEngineCoreProc,
     _get_grouped_ornith_prefill_target,
     _get_input_queue_batching_delay,
+    _get_ornith_prefill_profile,
 )
 from vllm_tt_plugin.platform import _set_tt_engine_core_proc_classes
 from vllm_tt_plugin.scheduler import TTSchedulingMode
@@ -347,6 +348,7 @@ def test_single_engine_non_grouped_config_preserves_base_queue_behavior(
 
 
 def test_single_engine_explicit_delay_opts_other_model_into_coalescing(monkeypatch):
+    monkeypatch.setenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, "invalid")
     config = _queue_delay_config(
         model_type="gemma4",
         max_num_seqs=8,
@@ -402,7 +404,9 @@ def test_input_queue_batching_delay_is_wider_only_for_grouped_ornith_prefill(
     max_num_seqs,
     max_num_partial_prefills,
     expected,
+    monkeypatch,
 ):
+    monkeypatch.delenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, raising=False)
     config = _queue_delay_config(
         model_type=model_type,
         max_num_seqs=max_num_seqs,
@@ -413,7 +417,8 @@ def test_input_queue_batching_delay_is_wider_only_for_grouped_ornith_prefill(
 
 
 @pytest.mark.parametrize("override", [0.0, 0.013])
-def test_input_queue_batching_delay_honors_explicit_tt_override(override):
+def test_input_queue_batching_delay_honors_explicit_tt_override(override, monkeypatch):
+    monkeypatch.setenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, "throughput")
     config = _queue_delay_config(
         model_type="qwen3_5_moe",
         max_num_seqs=8,
@@ -422,6 +427,70 @@ def test_input_queue_batching_delay_honors_explicit_tt_override(override):
     )
 
     assert _get_input_queue_batching_delay(config) == override
+
+
+def test_ornith_prefill_profile_is_strict_and_selects_the_throughput_window(
+    monkeypatch,
+):
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+    )
+    monkeypatch.delenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, raising=False)
+    assert _get_ornith_prefill_profile() == "interactive"
+    assert _get_input_queue_batching_delay(config) == 0.250
+
+    monkeypatch.setenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, "throughput")
+    assert _get_ornith_prefill_profile() == "throughput"
+    assert _get_input_queue_batching_delay(config) == 2.0
+
+    for value in ("", "fast", "Throughput", " throughput "):
+        monkeypatch.setenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, value)
+        if not value.strip():
+            assert _get_ornith_prefill_profile() == "interactive"
+        elif value.strip() == "throughput":
+            assert _get_ornith_prefill_profile() == "throughput"
+        else:
+            with pytest.raises(
+                ValueError, match=engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR
+            ):
+                _get_ornith_prefill_profile()
+
+
+def test_coalescing_exit_log_records_profile_delay_elapsed_target_and_waiting(
+    monkeypatch,
+):
+    monkeypatch.setenv(engine_module._ORNITH_PREFILL_PROFILE_ENV_VAR, "throughput")
+    config = _queue_delay_config(
+        model_type="qwen3_5_moe",
+        max_num_seqs=8,
+        max_num_partial_prefills=4,
+        override=0.013,
+    )
+    scheduler = _QueueScheduler(num_waiting=1)
+    clock = _FakeClock()
+    input_queue = _ScriptedInputQueue(clock)
+    core, _ = _queue_processing_core(config, scheduler, input_queue)
+    monkeypatch.setattr(engine_module.time, "monotonic", clock.monotonic)
+    messages = []
+    monkeypatch.setattr(
+        engine_module.logger,
+        "info",
+        lambda message, *args: messages.append(message % args),
+    )
+
+    engine_module._process_tt_input_queue(core, poll_idle_queue=False)
+
+    message = next(
+        message for message in messages if "TT prefill coalescing exit" in message
+    )
+    assert "profile=throughput" in message
+    assert "delay_seconds=0.013" in message
+    assert "elapsed_seconds=0.013" in message
+    assert "target=4" in message
+    assert "waiting=1" in message
+    assert "reason=deadline" in message
 
 
 @pytest.mark.parametrize(

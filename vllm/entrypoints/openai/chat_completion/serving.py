@@ -70,6 +70,55 @@ from vllm.utils.mistral import is_mistral_tool_parser
 logger = init_logger(__name__)
 
 
+def _truncate_parsed_output_at_stop(
+    reasoning: str | None,
+    content: str | None,
+    tool_calls: list[FunctionCall] | None,
+    stop_reason: str,
+    include_stop_str_in_output: bool,
+) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+    """Remove a matched stop string reintroduced by a token-based parser.
+
+    The engine's detokenizer removes stop strings from ``CompletionOutput.text``
+    while intentionally retaining the generated token IDs for accounting and
+    logprobs. Parsers such as Harmony consume those raw IDs, so they can
+    reconstruct the stop string (and any suffix decoded from the same token)
+    in a non-streaming parsed response. Reconcile the terminal parsed field
+    without changing the authoritative token sequence.
+    """
+    if not stop_reason:
+        return reasoning, content, tool_calls
+
+    def truncate(value: str) -> tuple[str | None, bool]:
+        stop_index = value.rfind(stop_reason)
+        if stop_index < 0:
+            return value, False
+        if include_stop_str_in_output:
+            stop_index += len(stop_reason)
+        return value[:stop_index] or None, True
+
+    # Harmony generation order is reasoning, then visible content, then tool
+    # calls. Search in reverse order so only the terminal parsed field is
+    # changed if the same text appeared legitimately earlier in the response.
+    if tool_calls:
+        for tool_call in reversed(tool_calls):
+            truncated_arguments, matched = truncate(tool_call.arguments)
+            if matched:
+                tool_call.arguments = truncated_arguments or ""
+                return reasoning, content, tool_calls
+
+    if content is not None:
+        truncated_content, matched = truncate(content)
+        if matched:
+            content = truncated_content
+            return reasoning, content, tool_calls
+
+    if reasoning is not None:
+        reasoning, _ = truncate(reasoning)
+
+    return reasoning, content, tool_calls
+
+
 def _get_mm_token_counts(engine_input: EngineInput) -> dict[str, int]:
     """Sum per-modality placeholder tokens from ``mm_placeholders``.
 
@@ -896,6 +945,14 @@ class OpenAIServingChat(GenerateBaseServing):
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
                 )
+                if isinstance(output.stop_reason, str):
+                    reasoning, content, tool_calls = _truncate_parsed_output_at_stop(
+                        reasoning,
+                        content,
+                        tool_calls,
+                        output.stop_reason,
+                        request.include_stop_str_in_output,
+                    )
                 suppress_metadata = not request.include_reasoning and parser is not None
                 if not request.include_reasoning:
                     reasoning = None

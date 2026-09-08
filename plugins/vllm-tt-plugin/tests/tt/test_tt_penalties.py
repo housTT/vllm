@@ -42,6 +42,11 @@ class TestRepetitionPenalty:
     def test_repetition_penalty_mixed_batch(
         self, tt_server, tt_model_name, max_batch_size
     ):
+        # A short greedy decode can keep selecting an overwhelmingly dominant
+        # repeated token even after the penalty is correctly applied (the
+        # exact margin varies with model precision and tensor parallelism).
+        # Fixed-seed sampling makes the distribution change observable while
+        # preserving deterministic equality within each penalty group.
         prompt = "a a a a a a a a a"
 
         configs = []
@@ -51,8 +56,9 @@ class TestRepetitionPenalty:
                 configs.append(
                     RequestConfig(
                         prompt=prompt,
-                        max_tokens=10,
-                        temperature=0,
+                        max_tokens=40,
+                        temperature=0.7,
+                        seed=42,
                         repetition_penalty=1.0,
                     )
                 )
@@ -61,8 +67,9 @@ class TestRepetitionPenalty:
                 configs.append(
                     RequestConfig(
                         prompt=prompt,
-                        max_tokens=10,
-                        temperature=0,
+                        max_tokens=40,
+                        temperature=0.7,
+                        seed=42,
                         repetition_penalty=2.0,
                     )
                 )
@@ -87,14 +94,18 @@ class TestPresencePenalty:
     def test_different_presence_penalties(
         self, tt_server, tt_model_name, max_batch_size
     ):
-        prompt = "a b c a b c a b c"
+        # Presence is a bounded, once-per-seen-token shift. Use reproducible
+        # stochastic sampling so the test observes distribution changes even
+        # when a model's greedy top-1 margin is greater than the maximum shift.
+        prompt = "One two three"
         penalties = [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0][:max_batch_size]
 
         configs = [
             RequestConfig(
                 prompt=prompt,
                 max_tokens=40,
-                temperature=0,
+                temperature=0.7,
+                seed=42,
                 presence_penalty=penalty,
             )
             for penalty in penalties
@@ -108,16 +119,17 @@ class TestPresencePenalty:
     def test_presence_penalty_mixed_batch(
         self, tt_server, tt_model_name, max_batch_size
     ):
-        # Presence penalty is only applied once regardless of the repetition,
-        # so we use a weaker prompt for more even logits
-        prompt = "a b c a b c a b c"
+        # Presence penalty is only applied once regardless of repetition, so
+        # use the same reproducible stochastic profile as the sweep above.
+        prompt = "One two three"
         configs = []
         for i in range(max_batch_size):
             configs.append(
                 RequestConfig(
                     prompt=prompt,
                     max_tokens=40,
-                    temperature=0,
+                    temperature=0.7,
+                    seed=42,
                     presence_penalty=0.0 if i % 2 == 0 else 2.0,
                 )
             )

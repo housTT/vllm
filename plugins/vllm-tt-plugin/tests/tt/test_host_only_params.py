@@ -6,6 +6,8 @@ Tests for sampling parameters which require host ("compat") sampling.
 
 import string
 
+import regex as re
+
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 
@@ -77,30 +79,38 @@ class TestHostOnlyParameters:
         assert results[0] is not None, "should produce output with logit_bias"
 
     def test_allowed_token_ids(self, tt_server, tt_model_name, max_batch_size):
-        """Test allowed_token_ids parameter (smoke test)."""
+        """Test allowed_token_ids without assuming low IDs decode visibly."""
+        allowlists = ([1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15])
         configs = [
             RequestConfig(
-                prompt="Allowed: ", max_tokens=10, allowed_token_ids=[1, 2, 3]
-            ),
-            RequestConfig(
-                prompt="Allowed: ", max_tokens=10, allowed_token_ids=[4, 5, 6]
-            ),
-            RequestConfig(
-                prompt="Allowed: ", max_tokens=10, allowed_token_ids=[7, 8, 9]
-            ),
-            RequestConfig(
-                prompt="Allowed: ", max_tokens=10, allowed_token_ids=[10, 11, 12]
-            ),
-            RequestConfig(
-                prompt="Allowed: ", max_tokens=10, allowed_token_ids=[13, 14, 15]
-            ),
+                prompt="Allowed: ",
+                max_tokens=10,
+                allowed_token_ids=list(allowed),
+                logprobs=0,
+                return_tokens_as_token_ids=True,
+            )
+            for allowed in allowlists
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results = run_concurrent_batch(
+            tt_server, tt_model_name, configs, return_full_response=True
+        )
         assert len(results) == len(configs)
-        # With only 3 allowed tokens, output should be limited
-        for i, result in enumerate(results):
-            assert result is not None, f"should produce output for request {i}"
-            assert len(result) > 0, f"should produce non-empty output for request {i}"
+        # Inspect IDs rather than decoded text: low IDs can be EOS/control
+        # tokens and legitimately decode to an empty string for some models.
+        for i, (response, allowed) in enumerate(zip(results, allowlists)):
+            assert response.usage.completion_tokens > 0, (
+                f"should produce at least one token for request {i}"
+            )
+            tokens = response.choices[0].logprobs.tokens
+            token_ids = [
+                int(value)
+                for token in tokens
+                for value in re.findall(r"token_id:(\d+)", token)
+            ]
+            assert token_ids, f"should produce at least one token for request {i}"
+            assert set(token_ids) <= set(allowed), (
+                f"request {i} produced IDs outside {allowed}: {token_ids}"
+            )
 
     def test_min_tokens(self, tt_server, tt_model_name, max_batch_size):
         """Test min_tokens parameter ensures minimum output length."""

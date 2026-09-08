@@ -152,6 +152,11 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        self.supports_device_penalties = TTPlatform.supports_device_penalties
+        self.supports_device_seeded_sampling = (
+            TTPlatform.supports_device_seeded_sampling
+        )
+        self.max_device_top_k = TTPlatform.max_device_top_k
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -2624,6 +2629,36 @@ class TTModelRunner:
         )
         if has_always_host_only_sampling_params:
             return False
+
+        # Some device samplers implement only temperature/top-k/top-p. Route
+        # unsupported penalties through vLLM's canonical host sampler so the
+        # prompt/output token history is applied instead of silently ignored.
+        if not self.supports_device_penalties and (
+            input_batch.presence_penalties_reqs
+            or input_batch.frequency_penalties_reqs
+            or input_batch.repetition_penalties_reqs
+        ):
+            return False
+
+        # A stateful per-row device RNG cannot preserve a seeded request when
+        # scheduler compaction or staggered admission moves/reuses rows. Models
+        # without an absolute-position seed manager explicitly use the host
+        # sampler for seeded compatibility tests. Unseeded and greedy serving
+        # continue through the traced device sampler.
+        if not self.supports_device_seeded_sampling:
+            active_seeds = input_batch.sampling.seed[: input_batch.num_reqs]
+            if bool((active_seeds != SEED_NONE_SENTINEL).any().item()):
+                return False
+
+        # Do not silently clamp a stochastic request beyond the model's
+        # advertised device top-k. Greedy requests are unaffected by top-k and
+        # remain eligible for the performance path.
+        if self.max_device_top_k is not None:
+            active = slice(0, input_batch.num_reqs)
+            top_k = input_batch.sampling.top_k[active]
+            temperature = input_batch.sampling.temperature[active]
+            if bool(((temperature > 0) & (top_k > self.max_device_top_k)).any().item()):
+                return False
 
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277

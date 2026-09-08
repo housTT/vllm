@@ -771,6 +771,9 @@ def get_mesh_grid(local_dp_rank=0):
     return mesh_grid
 
 
+_PARENT_MESH_BY_SUBMESH_ID: dict[int, ttnn.MeshDevice] = {}
+
+
 def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
     assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
     mesh_grid = get_mesh_grid(local_dp_rank)
@@ -778,15 +781,52 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
 
-    # Set fabric before opening the device
-    num_devices_requested = mesh_grid[0] * mesh_grid[1]
+    parent_grid = None
+    submesh_offset = (0, 0)
+    if tt_config and "parent_mesh_shape" in tt_config:
+        parent_grid = tuple(int(value) for value in tt_config["parent_mesh_shape"])
+        assert len(parent_grid) == 2 and all(value > 0 for value in parent_grid), (
+            "parent_mesh_shape must contain two positive dimensions"
+        )
+        submesh_offset = tuple(
+            int(value) for value in tt_config.get("submesh_offset", (0, 0))
+        )
+        assert len(submesh_offset) == 2 and all(
+            value >= 0 for value in submesh_offset
+        ), "submesh_offset must contain two non-negative coordinates"
+        assert all(
+            submesh_offset[axis] + mesh_grid[axis] <= parent_grid[axis]
+            for axis in range(2)
+        ), (
+            f"requested submesh shape {mesh_grid} at {submesh_offset} does not "
+            f"fit parent mesh {parent_grid}"
+        )
+
+    # Set fabric before opening the device. A physical parent mesh may need to
+    # initialize every router even when the model uses only one submesh.
+    opened_grid = parent_grid or mesh_grid
+    num_devices_requested = opened_grid[0] * opened_grid[1]
     set_fabric(tt_config, num_devices_requested)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
+    opened_mesh = ttnn.open_mesh_device(
+        ttnn.MeshShape(*opened_grid),
         dispatch_core_config=get_dispatch_core_config(tt_config),
         **device_params,
     )
+    if parent_grid is not None:
+        mesh_device = opened_mesh.create_submesh(
+            ttnn.MeshShape(*mesh_grid),
+            offset=ttnn.MeshCoordinate(*submesh_offset),
+        )
+        _PARENT_MESH_BY_SUBMESH_ID[id(mesh_device)] = opened_mesh
+        logger.info(
+            "created model submesh grid %s at %s from physical parent %s",
+            mesh_grid,
+            submesh_offset,
+            parent_grid,
+        )
+    else:
+        mesh_device = opened_mesh
     logger.info(
         "multidevice with %d devices and grid %s is created",
         mesh_device.get_num_devices(),
@@ -796,14 +836,19 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
 
 def close_mesh_device(mesh_device, tt_config):
-    # Read device profiler (no-op if not profiling with tracy)
-    ttnn.ReadDeviceProfiler(mesh_device)
-
-    # Close devices
-    num_devices = mesh_device.get_num_devices()
+    # Close devices. When serving through a physical parent, close the model
+    # submesh before the parent that owns the underlying device drivers.
+    parent_mesh = _PARENT_MESH_BY_SUBMESH_ID.pop(id(mesh_device), None)
+    num_devices = (
+        parent_mesh.get_num_devices()
+        if parent_mesh is not None
+        else mesh_device.get_num_devices()
+    )
     for submesh in mesh_device.get_submeshes():
         ttnn.close_mesh_device(submesh)
     ttnn.close_mesh_device(mesh_device)
+    if parent_mesh is not None:
+        ttnn.close_mesh_device(parent_mesh)
 
     # Reset fabric
     reset_fabric(tt_config, num_devices)

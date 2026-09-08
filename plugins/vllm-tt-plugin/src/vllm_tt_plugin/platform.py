@@ -503,7 +503,19 @@ def register_tt_models(register_test_models=False) -> None:
     # fallback resolves it to ``TransformersMultiModalForCausalLM``. We map
     # the unified arch (and its ``TT`` alias) to the same text-only TT class
     # so text-only inference runs on the unified checkpoint.
-    _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    gemma4_text_version = os.getenv("TT_GEMMA4_TEXT_VER", "tt_transformers")
+    if gemma4_text_version == "tt_transformers":
+        _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    elif gemma4_text_version == "google_gemma_4_26b_a4b_it_autoport":
+        _gemma4_target = (
+            "models.autoports.google_gemma_4_26b_a4b_it.tt.generator_vllm:"
+            "Gemma4ForCausalLM"
+        )
+    else:
+        raise ValueError(
+            f"Unsupported TT Gemma4 version: {gemma4_text_version}, pick one of "
+            "[tt_transformers, google_gemma_4_26b_a4b_it_autoport]"
+        )
     for arch in (
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
@@ -564,6 +576,9 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
+    supports_device_penalties: ClassVar[bool] = True
+    supports_device_seeded_sampling: ClassVar[bool] = True
+    max_device_top_k: ClassVar[int | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -722,6 +737,23 @@ class TTPlatform(Platform):
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
+        )
+
+        # Models may use the shared compatibility sampler for request features
+        # that their device sampler does not yet implement. Defaults preserve
+        # the existing contract for models that already support these features.
+        cls.supports_device_penalties = (
+            model_capabilities.get("supports_device_penalties", True)
+            if model_capabilities
+            else True
+        )
+        cls.supports_device_seeded_sampling = (
+            model_capabilities.get("supports_device_seeded_sampling", True)
+            if model_capabilities
+            else True
+        )
+        cls.max_device_top_k = (
+            model_capabilities.get("max_device_top_k") if model_capabilities else None
         )
 
         # A model either supports the full on-device sampling pipeline or it

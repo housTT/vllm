@@ -1224,11 +1224,12 @@ class TTModelRunner:
             # state available before inputs are gathered.
             perform_device_sampling = False
 
-        # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only).
+        # Decode penalties and multi-token bad words need the output history.
         prompt_tokens = None
         output_tokens = None
-        if (not input_batch.no_penalties) and not is_prompt:
+        if (
+            not input_batch.no_penalties or input_batch.sampling.bad_words_token_ids
+        ) and not is_prompt:
             # Restrict to this build's requests. For lane builds ``req_indices``
             # selects one lane's rows out of the merged batch; passing them
             # keeps penalty history attributed to the right requests instead of

@@ -87,7 +87,10 @@ class TestPresencePenalty:
     def test_different_presence_penalties(
         self, tt_server, tt_model_name, max_batch_size
     ):
-        prompt = "a b c a b c a b c"
+        # Repeated abc can stay over 2 logits ahead under correct presence
+        # penalties. Use a sensitive natural continuation; measured controls:
+        # Ornith doc/vllm_integration/AUTODEBUG_presence_variation.md in tt-metal.
+        prompt = "Once upon a time"
         penalties = [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0][:max_batch_size]
 
         configs = [
@@ -108,9 +111,9 @@ class TestPresencePenalty:
     def test_presence_penalty_mixed_batch(
         self, tt_server, tt_model_name, max_batch_size
     ):
-        # Presence penalty is only applied once regardless of the repetition,
-        # so we use a weaker prompt for more even logits
-        prompt = "a b c a b c a b c"
+        # The same sensitive continuation must show both the penalty effect
+        # and independent, deterministic cohorts in a mixed batch.
+        prompt = "Once upon a time"
         configs = []
         for i in range(max_batch_size):
             configs.append(

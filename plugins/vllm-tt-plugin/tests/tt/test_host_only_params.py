@@ -4,9 +4,18 @@
 Tests for sampling parameters which require host ("compat") sampling.
 """
 
-import string
-
 from tests.tt.utils import RequestConfig, run_concurrent_batch
+from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import get_tokenizer
+
+
+def _assert_no_bad_word_sequences(token_ids, bad_word_sequences):
+    for sequence in bad_word_sequences:
+        for start in range(len(token_ids) - len(sequence) + 1):
+            assert token_ids[start : start + len(sequence)] != sequence, (
+                f"Banned token sequence {sequence} starts at output index {start}: "
+                f"{token_ids}"
+            )
 
 
 class TestHostOnlyParameters:
@@ -32,8 +41,12 @@ class TestHostOnlyParameters:
         )
 
     def test_bad_words(self, tt_server, tt_model_name, max_batch_size):
-        """Test bad_words parameter prevents specified words from appearing."""
+        """Test bad_words excludes the tokenizer's forbidden token sequences."""
         bad_words = ["hello", "Hello", "hi", "Hi", "hey", "Hey"]
+        sampling_params = SamplingParams(bad_words=bad_words)
+        sampling_params.update_from_tokenizer(get_tokenizer(tt_model_name))
+        bad_word_sequences = sampling_params.bad_words_token_ids
+        assert bad_word_sequences
         configs = [
             # Run multiple times with high temperature to increase coverage
             RequestConfig(
@@ -42,26 +55,25 @@ class TestHostOnlyParameters:
                 bad_words=bad_words,
                 temperature=1.0,
                 seed=i,
+                return_token_ids=True,
             )
             for i in range(5)
         ]
         # bad_words is only available in chat completions API
-        results = run_concurrent_batch(tt_server, tt_model_name, configs, use_chat=True)
+        results = run_concurrent_batch(
+            tt_server, tt_model_name, configs, use_chat=True, return_full_response=True
+        )
         assert len(results) == len(configs)
 
-        for i, text in enumerate(results):
-            assert text is not None, f"Response {i} content is None"
-            # Strip punctuation except '>' to avoid false positives from
-            # BPE-merged tokens like ">Hello" (a single token distinct from "Hello")
-            punct = string.punctuation.replace(">", "")
-            words = [word.strip(punct) for word in text.split()]
-
-            # Check if any bad word appears as a whole word (case-insensitive)
-            for bad_word in bad_words:
-                assert bad_word not in words, (
-                    f"bad_word '{bad_word}' found as whole word"
-                    f"in response {i}: {text!r}"
-                )
+        for i, response in enumerate(results):
+            choice = response.choices[0]
+            assert choice.message.content, f"Response {i} content is empty"
+            token_ids = choice.model_dump().get("token_ids")
+            assert token_ids, f"Response {i} generated token IDs are missing"
+            # vLLM bans token sequences, not every spelling-equivalent BPE
+            # segmentation. For example, allowed tokens "h" + "ello" must not
+            # be confused with the banned singleton "hello" by re-tokenizing.
+            _assert_no_bad_word_sequences(token_ids, bad_word_sequences)
 
     def test_logit_bias(self, tt_server, tt_model_name, max_batch_size):
         """Test logit_bias parameter (smoke test)."""

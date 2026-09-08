@@ -25,6 +25,7 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    return_token_ids: bool = False
 
 
 async def send_request(
@@ -32,6 +33,8 @@ async def send_request(
 ):
     """Send a single async legacy completion request (old API)."""
     extra_body: dict[str, Any] = {}
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
     if config.repetition_penalty != 1.0:
@@ -71,6 +74,8 @@ async def send_chat_request(
 ):
     """Send a single async chat completion request (new API)."""
     extra_body: dict[str, Any] = {}
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
     if config.repetition_penalty != 1.0:

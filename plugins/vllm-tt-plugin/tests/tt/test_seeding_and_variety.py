@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -11,6 +12,36 @@ from tests.tt.utils import (
     assert_varied,
     run_concurrent_batch,
 )
+from vllm.tokenizers import cached_get_tokenizer
+
+
+def _run_batch_with_first_tokens(tt_server, tt_model_name, configs):
+    responses = run_concurrent_batch(
+        tt_server,
+        tt_model_name,
+        [replace(config, return_token_ids=True) for config in configs],
+        return_full_response=True,
+    )
+    assert len(responses) == len(configs), "Expected one response per request"
+    texts = []
+    first_token_ids = []
+    for i, response in enumerate(responses):
+        choice = response.choices[0]
+        assert isinstance(choice.text, str), f"Response {i} completion text is missing"
+        token_ids = choice.model_dump().get("token_ids")
+        assert token_ids, f"Response {i} generated token IDs are missing"
+        if not choice.text:
+            # EOS is a sampled token even when special-token skipping leaves
+            # no display text. Other empty outputs still need investigation.
+            eos_token_id = cached_get_tokenizer(tt_model_name).eos_token_id
+            assert (
+                choice.finish_reason == "stop"
+                and eos_token_id is not None
+                and token_ids[-1] == eos_token_id
+            ), f"Response {i} completion is empty without terminal EOS evidence"
+        texts.append(choice.text)
+        first_token_ids.append(token_ids[0])
+    return texts, first_token_ids
 
 
 class TestSeedingAndVariety:
@@ -42,8 +73,12 @@ class TestSeedingAndVariety:
                     )
                 )
 
-        results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
-        results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results1, first_tokens1 = _run_batch_with_first_tokens(
+            tt_server, tt_model_name, configs
+        )
+        results2, first_tokens2 = _run_batch_with_first_tokens(
+            tt_server, tt_model_name, configs
+        )
 
         # This tests both prefill and decode
         all_greedy = results1[:greedy_count] + results2[:greedy_count]
@@ -54,6 +89,7 @@ class TestSeedingAndVariety:
 
         # Check answers overall
         different_seeds = []
+        prefill_different_seeds = []
         for i in range(seeds):
             results_for_seed = [
                 results1[greedy_count + i],
@@ -67,6 +103,17 @@ class TestSeedingAndVariety:
                 "across positions and runs.",
             )
             different_seeds.append(results_for_seed[0])
+            first_tokens_for_seed = [
+                first_tokens1[greedy_count + i],
+                first_tokens2[greedy_count + i],
+                first_tokens1[greedy_count + seeds + i],
+                first_tokens2[greedy_count + seeds + i],
+            ]
+            assert_deterministic(
+                first_tokens_for_seed,
+                "Seeded first tokens should match across positions and runs.",
+            )
+            prefill_different_seeds.append(first_tokens_for_seed[0])
         expected_variety = seeds // 3
         assert_varied(
             different_seeds,
@@ -75,7 +122,6 @@ class TestSeedingAndVariety:
         )
 
         # Check first tokens to make sure prefill is varied
-        prefill_different_seeds = [x[:1] for x in different_seeds]
         assert_varied(
             prefill_different_seeds,
             expected_variety,
@@ -264,11 +310,12 @@ class TestSeedingAndVariety:
         ]
 
         # Overall
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results, prefill_results = _run_batch_with_first_tokens(
+            tt_server, tt_model_name, configs
+        )
         assert_varied(results, 2, "With temperature=5, outputs should vary in batch.")
 
         # First token (prefill)
-        prefill_results = [x[:1] for x in results]
         assert_varied(
             prefill_results, 2, "With temperature=5, first tokens should vary in batch."
         )
@@ -281,14 +328,17 @@ class TestSeedingAndVariety:
         tries = 10
 
         # Overall
-        results = [
-            run_concurrent_batch(tt_server, tt_model_name, configs)[0]
-            for _ in range(tries)
-        ]
+        results = []
+        prefill_results = []
+        for _ in range(tries):
+            texts, first_token_ids = _run_batch_with_first_tokens(
+                tt_server, tt_model_name, configs
+            )
+            results.append(texts[0])
+            prefill_results.append(first_token_ids[0])
         assert_varied(results, 2, "With temperature=5, outputs should vary on re-runs.")
 
         # First token (prefill)
-        prefill_results = [x[:1] for x in results]
         assert_varied(
             prefill_results,
             2,
@@ -310,11 +360,18 @@ class TestSeedingAndVariety:
         ]
         joint_configs = greedy_config + topk_configs
 
-        results_1 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
-        results_2 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+        results_1, first_tokens_1 = _run_batch_with_first_tokens(
+            tt_server, tt_model_name, joint_configs
+        )
+        results_2, first_tokens_2 = _run_batch_with_first_tokens(
+            tt_server, tt_model_name, joint_configs
+        )
 
         # Within each batch:
-        for results in [results_1, results_2]:
+        for results, first_tokens in [
+            (results_1, first_tokens_1),
+            (results_2, first_tokens_2),
+        ]:
             # Overall
             greedy_results = results[:num_greedy]
             non_greedy_results = results[num_greedy:]
@@ -327,7 +384,7 @@ class TestSeedingAndVariety:
             )
 
             # First token (prefill)
-            prefill_results = [x[:1] for x in non_greedy_results]
+            prefill_results = first_tokens[num_greedy:]
             assert_varied(
                 prefill_results, 2, "With top_k=10, first tokens should vary in batch."
             )
@@ -351,8 +408,8 @@ class TestSeedingAndVariety:
         )
 
         # First token (prefill)
-        prefill_results_1 = [x[:1] for x in non_greedy_results_1]
-        prefill_results_2 = [x[:1] for x in non_greedy_results_2]
+        prefill_results_1 = first_tokens_1[num_greedy:]
+        prefill_results_2 = first_tokens_2[num_greedy:]
         assert_pairwise_varied(
             prefill_results_1,
             prefill_results_2,

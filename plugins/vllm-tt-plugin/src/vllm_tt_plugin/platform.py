@@ -409,6 +409,14 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
     # Qwen3.5 - Text
+    # Ornith has its own architecture alias so other Qwen3.5 checkpoints keep
+    # their existing adapter. Select with hf_overrides.architectures.
+    for arch in ("OrnithForCausalLM", "TTOrnithForCausalLM"):
+        _register_model_if_missing(
+            ModelRegistry,
+            arch,
+            "models.autoports.ornith_ai_ornith_1_5_9b.tt.generator_vllm:TTOrnithForCausalLM",
+        )
     _register_model_if_missing(
         ModelRegistry,
         "TTQwen3_5ForConditionalGeneration",

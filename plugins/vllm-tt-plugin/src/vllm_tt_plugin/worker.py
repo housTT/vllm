@@ -493,17 +493,34 @@ class TTWorker(WorkerBase):
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
-    # ---- Destructor (used to close devices) ----
+    # ---- Explicit worker lifecycle ----
+
+    def shutdown(self) -> None:
+        """Release model traces and the mesh at the engine's shutdown boundary."""
+        mesh_device = getattr(self, "mesh_device", None)
+        model_runner = getattr(self, "model_runner", None)
+        self.mesh_device = None
+        self.model_runner = None
+        if mesh_device is None:
+            return
+
+        logger.info("Closing TT worker model and mesh")
+        model = getattr(model_runner, "model", None)
+        try:
+            teardown = getattr(model, "teardown", None)
+            if callable(teardown):
+                teardown()
+        finally:
+            teardown = None
+            del model
+            del model_runner
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            logger.info("TT worker mesh closed and fabric reset")
 
     def __del__(self):
-        # Delete model runner first in case there are model artifacts
-        with suppress(AttributeError):
-            # attributes may be already torn down when destructor is called
-            del self.model_runner
-
-            if self.mesh_device:
-                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
-                del self.mesh_device
+        # Engine shutdown is explicit; finalization is only a best-effort fallback.
+        with suppress(Exception):
+            self.shutdown()
 
         if hasattr(super(), "__del__"):
             super().__del__()  # type: ignore
@@ -687,7 +704,18 @@ def set_fabric(tt_config, num_devices):
             fabric_config,
             reliability_mode,
         )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+        router_config = None
+        if tt_config and "fabric_max_packet_payload_size_bytes" in tt_config:
+            router_config = ttnn.FabricRouterConfig()
+            router_config.max_packet_payload_size_bytes = int(
+                tt_config["fabric_max_packet_payload_size_bytes"]
+            )
+        if router_config is None:
+            ttnn.set_fabric_config(fabric_config, reliability_mode)
+        else:
+            ttnn.set_fabric_config(
+                fabric_config, reliability_mode, router_config=router_config
+            )
 
 
 # From tt-metal/conftest.py:
@@ -797,9 +825,6 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
 
 def close_mesh_device(mesh_device, tt_config):
-    # Read device profiler (no-op if not profiling with tracy)
-    ttnn.ReadDeviceProfiler(mesh_device)
-
     # Close devices
     num_devices = mesh_device.get_num_devices()
     for submesh in mesh_device.get_submeshes():

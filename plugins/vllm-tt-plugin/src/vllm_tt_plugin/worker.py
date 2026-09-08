@@ -493,19 +493,25 @@ class TTWorker(WorkerBase):
             intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
-    # ---- Destructor (used to close devices) ----
-
-    def __del__(self):
-        # Delete model runner first in case there are model artifacts
+    def shutdown(self) -> None:
+        """Release model artifacts and devices during explicit engine shutdown."""
+        # A failed runner initialization must not prevent closing an open mesh.
         with suppress(AttributeError):
-            # attributes may be already torn down when destructor is called
             del self.model_runner
 
-            if self.mesh_device:
-                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
-                del self.mesh_device
+        mesh_device = getattr(self, "mesh_device", None)
+        if mesh_device is not None:
+            logger.info("TTWorker mesh shutdown starting")
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            self.mesh_device = None
+            logger.info("TTWorker mesh shutdown complete")
 
-        if hasattr(super(), "__del__"):
+    def __del__(self):
+        # Best-effort fallback for partially initialized workers and interpreter
+        # teardown. Explicit shutdown above must propagate cleanup failures.
+        with suppress(Exception):
+            self.shutdown()
+        with suppress(Exception):
             super().__del__()  # type: ignore
 
 

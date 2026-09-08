@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from unittest.mock import Mock
 
+import pytest
 import vllm_tt_plugin.worker as worker
 
 
@@ -19,7 +20,7 @@ class _FakeMesh:
         return self.num_devices
 
     def get_submeshes(self):
-        return []
+        return [entry[2] for entry in self.created]
 
 
 def test_parent_mesh_opens_physical_fabric_and_returns_requested_submesh(monkeypatch):
@@ -84,3 +85,85 @@ def test_direct_mesh_close_does_not_read_device_profiler(monkeypatch):
     assert closed == [mesh]
     read_profiler.assert_not_called()
     reset_fabric.assert_called_once_with({}, 1)
+
+
+@pytest.mark.parametrize("has_model_runner", [False, True])
+def test_worker_shutdown_closes_owned_meshes_once(monkeypatch, has_model_runner):
+    parent = _FakeMesh(4)
+    mesh = parent.create_submesh((1, 2), offset=(0, 0))
+    nested = mesh.create_submesh((1, 1), offset=(0, 0))
+    worker._PARENT_MESH_BY_SUBMESH_ID[id(mesh)] = parent
+    closed = []
+    reset_fabric = Mock()
+    monkeypatch.setattr(worker.ttnn, "close_mesh_device", closed.append)
+    monkeypatch.setattr(worker, "reset_fabric", reset_fabric)
+    config = {"parent_mesh_shape": [2, 2]}
+    monkeypatch.setattr(worker, "get_tt_config", lambda _: config)
+    instance = worker.TTWorker.__new__(worker.TTWorker)
+    instance.mesh_device = mesh
+    instance.vllm_config = object()
+    if has_model_runner:
+        instance.model_runner = object()
+
+    instance.shutdown()
+    instance.shutdown()
+    instance.__del__()
+
+    assert closed == [nested, mesh, parent]
+    assert instance.mesh_device is None
+    assert not hasattr(instance, "model_runner")
+    reset_fabric.assert_called_once_with(config, 4)
+    assert id(mesh) not in worker._PARENT_MESH_BY_SUBMESH_ID
+
+
+@pytest.mark.parametrize("has_mesh_attribute", [False, True])
+def test_worker_shutdown_without_device(monkeypatch, has_mesh_attribute):
+    close_mesh = Mock()
+    monkeypatch.setattr(worker, "close_mesh_device", close_mesh)
+    instance = worker.TTWorker.__new__(worker.TTWorker)
+    instance.model_runner = object()
+    if has_mesh_attribute:
+        instance.mesh_device = None
+
+    instance.shutdown()
+    instance.__del__()
+
+    assert not hasattr(instance, "model_runner")
+    close_mesh.assert_not_called()
+
+
+def test_worker_destructor_uses_shutdown_without_model_runner(monkeypatch):
+    close_mesh = Mock()
+    monkeypatch.setattr(worker, "close_mesh_device", close_mesh)
+    monkeypatch.setattr(worker, "get_tt_config", lambda _: {})
+    instance = worker.TTWorker.__new__(worker.TTWorker)
+    mesh = object()
+    instance.mesh_device = mesh
+    instance.vllm_config = object()
+
+    instance.__del__()
+    instance.__del__()
+
+    close_mesh.assert_called_once_with(mesh, {})
+    assert instance.mesh_device is None
+
+
+def test_explicit_shutdown_surfaces_close_failure(monkeypatch):
+    close_mesh = Mock(side_effect=RuntimeError("mesh close failed"))
+    logger = Mock()
+    monkeypatch.setattr(worker, "close_mesh_device", close_mesh)
+    monkeypatch.setattr(worker, "get_tt_config", lambda _: {})
+    monkeypatch.setattr(worker, "logger", logger)
+    instance = worker.TTWorker.__new__(worker.TTWorker)
+    mesh = object()
+    instance.mesh_device = mesh
+    instance.vllm_config = object()
+
+    with pytest.raises(RuntimeError, match="mesh close failed"):
+        instance.shutdown()
+
+    assert instance.mesh_device is mesh
+    logger.info.assert_called_once_with("TTWorker mesh shutdown starting")
+    # Destruction remains best effort, while a failed explicit call propagates.
+    instance.__del__()
+    instance.mesh_device = None

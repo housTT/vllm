@@ -720,10 +720,22 @@ async def benchmark(
         for _ in range(num_warmups):
             request_task = asyncio.create_task(warmup_limited_request_func())
             warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
             warmup_pbar.close()
+        successful_warmups = sum(output.success for output in warmup_outputs)
+        print(f"Successful warmup requests: {successful_warmups}/{num_warmups}")
+        if successful_warmups != num_warmups:
+            errors = "\n".join(
+                f"Warmup request {index + 1}: {output.error}"
+                for index, output in enumerate(warmup_outputs)
+                if not output.success
+            )
+            raise ValueError(
+                f"Warmup run failed: {num_warmups - successful_warmups} of "
+                f"{num_warmups} requests failed.\n{errors}"
+            )
         print("Warmup run completed.")
 
     print("Starting main benchmark run...")

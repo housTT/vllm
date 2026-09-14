@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -82,11 +83,68 @@ def build_cached_request_state(new_req_data) -> CachedRequestState:
     )
 
 
+def checkpoint_request_rng(request: CachedRequestState) -> None:
+    """Save the exact state before a host draw, including seed advancement."""
+    if request.generator is None:
+        return
+    checkpoints = getattr(request, "_tt_rng_checkpoints", None)
+    if checkpoints is None:
+        checkpoints = {}
+        request._tt_rng_checkpoints = checkpoints
+    position = max(
+        len(request.output_token_ids),
+        getattr(request, "_tt_next_rng_output", 0),
+    )
+    checkpoints[position] = request.generator.get_state()
+    request._tt_next_rng_output = position + 1
+
+
+def acknowledge_request_outputs(request: CachedRequestState, accepted: int) -> None:
+    """Keep only RNG checkpoints for outputs the scheduler has not accepted."""
+    checkpoints = getattr(request, "_tt_rng_checkpoints", None)
+    if checkpoints is not None:
+        for position in list(checkpoints):
+            if position < accepted:
+                del checkpoints[position]
+
+
+def restore_request_rng(request: CachedRequestState, accepted: int) -> None:
+    checkpoints = getattr(request, "_tt_rng_checkpoints", {})
+    # Device-sampled positions consume no host RNG and need no checkpoint.
+    discarded = [position for position in checkpoints if position >= accepted]
+    if discarded and request.generator is not None:
+        request.generator.set_state(checkpoints[min(discarded)])
+    request._tt_rng_checkpoints = {}
+    request._tt_next_rng_output = accepted
+
+
+def preempt_cached_request_state(
+    request: CachedRequestState, accepted: int | None = None
+) -> CachedRequestState:
+    """Give resumed work a new identity, history list and RNG ownership.
+
+    Deferred completions retain the old state and generator. Their identity
+    checks now reject history writes, and a late sampler cannot mutate the new
+    generator. Ordinary scheduling and unscheduled pauses keep their identity.
+    """
+    resumed = copy.copy(request)
+    resumed.output_token_ids = list(request.output_token_ids)
+    if request.generator is not None:
+        resumed.generator = clone_torch_generator(request.generator)
+    resumed._tt_rng_checkpoints = dict(getattr(request, "_tt_rng_checkpoints", {}))
+    if accepted is not None:
+        del resumed.output_token_ids[accepted:]
+        restore_request_rng(resumed, accepted)
+    return resumed
+
+
 def apply_cached_req_state_update(
     req_state: CachedRequestState,
     num_computed_tokens: int,
     new_block_ids,
     resumed_from_preemption: bool,
+    num_output_tokens: int,
+    all_token_ids: list[int] | None = None,
 ) -> None:
     """Apply a ``scheduled_cached_reqs`` update to a request's cached state.
 
@@ -99,6 +157,17 @@ def apply_cached_req_state_update(
     if resumed_from_preemption:
         assert new_block_ids is not None
         req_state.block_ids = new_block_ids
+        # Placeholders have been reset by TT preemption. Resume therefore
+        # carries accepted history; ordinary async updates may include pending
+        # placeholders and must never truncate worker outputs.
+        if all_token_ids is not None:
+            accepted_ids = all_token_ids[req_state.num_prompt_tokens :]
+            assert len(accepted_ids) == num_output_tokens
+            req_state.output_token_ids[:] = accepted_ids
+        else:
+            assert len(req_state.output_token_ids) >= num_output_tokens
+            del req_state.output_token_ids[num_output_tokens:]
+        restore_request_rng(req_state, num_output_tokens)
     elif new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
             block_ids.extend(new_ids)
@@ -243,6 +312,7 @@ class InputBatch:
         )
 
         self.req_output_token_ids: list[list[int] | None] = []
+        self._request_states: dict[str, CachedRequestState] = {}
 
         # Sampling-related.
         self.sampling = SamplingInputBatch(max_num_reqs, logitsprocs=logitsprocs)
@@ -299,6 +369,7 @@ class InputBatch:
         )
 
         req_id = request.req_id
+        self._request_states[req_id] = request
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
@@ -435,6 +506,7 @@ class InputBatch:
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
             return None
+        self._request_states.pop(req_id, None)
         self.sampling.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
@@ -678,16 +750,13 @@ class InputBatch:
         # this once per lane) passes the lane's indices to advance every
         # generator exactly once per step rather than once per lane. ``None``
         # advances all generators (whole-batch build, called once per step).
-        if req_indices is None:
-            generators = list(self.sampling.generators.values())
-        else:
-            generators = [
-                self.sampling.generators[i]
-                for i in req_indices
-                if i in self.sampling.generators
-            ]
-        for generator in generators:
-            # Sample once from the generator to advance its state.
+        indices = list(self.sampling.generators) if req_indices is None else req_indices
+        for index in indices:
+            generator = self.sampling.generators.get(index)
+            if generator is None:
+                continue
+            checkpoint_request_rng(self._request_states[self.req_ids[index]])
+            # Preserve the existing seed advancement and subsequent sampler draw.
             torch.rand(1, generator=generator)
 
 
@@ -870,6 +939,15 @@ class TTLaneInputBatch(InputBatch):
             if self.remove_request(req_id) is not None:
                 layout_changed = True
 
+        accepted_counts = getattr(scheduler_output, "_tt_accepted_output_tokens", {})
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if req_id in requests:
+                requests[req_id] = preempt_cached_request_state(
+                    requests[req_id], accepted_counts.get(req_id)
+                )
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
         # Free cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             encoder_cache.pop(mm_hash, None)
@@ -887,9 +965,19 @@ class TTLaneInputBatch(InputBatch):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            if resumed_from_preemption:
+                req_state = preempt_cached_request_state(req_state)
+                requests[req_id] = req_state
             apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                req_data.num_output_tokens[i],
+                req_data.all_token_ids.get(req_id),
             )
+            if req_id in accepted_counts:
+                acknowledge_request_outputs(req_state, accepted_counts[req_id])
             if resumed_from_preemption:
                 # KV was freed and is being rebuilt; re-add fresh (drop the
                 # stale slot first). The slot may differ afterwards --
@@ -1023,6 +1111,9 @@ class TTLaneInputBatch(InputBatch):
                 for row, gen in sampling.generators.items()
                 if row in scheduled
             }
+        for row, generator in generators.items():
+            if generator is sampling.generators[row]:
+                checkpoint_request_rng(self._request_states[self.req_ids[row]])
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
             all_greedy=all_greedy,
@@ -1260,6 +1351,7 @@ class TTLaneInputBatch(InputBatch):
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
+            original_prompt_lens=lane_batch.num_prompt_tokens[rows_np].tolist(),
             block_tables=block_tables_per_group[0],
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=runner._block_tables_per_layer(

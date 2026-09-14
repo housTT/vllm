@@ -48,9 +48,11 @@ from vllm_tt_plugin.input_batch import (
     CachedRequestState,
     InputBatch,
     TTLaneInputBatch,
+    acknowledge_request_outputs,
     apply_cached_req_state_update,
     build_cached_request_state,
     clone_torch_generator,
+    preempt_cached_request_state,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -221,6 +223,9 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Includes generated-history replay after a preempted request has
+        # crossed its original prompt boundary. Retain across unscheduled steps.
+        self._chunked_prefill_req_ids: set[str] = set()
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -618,7 +623,19 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+        accepted_counts = getattr(scheduler_output, "_tt_accepted_output_tokens", {})
+        for req_id in scheduler_output.preempted_req_ids or ():
+            if req_id in self.requests:
+                self.requests[req_id] = preempt_cached_request_state(
+                    self.requests[req_id], accepted_counts.get(req_id)
+                )
         self._release_dead_state_slots(scheduler_output)
+        self._chunked_prefill_req_ids.difference_update(
+            scheduler_output.finished_req_ids
+        )
+        self._chunked_prefill_req_ids.difference_update(
+            scheduler_output.preempted_req_ids or ()
+        )
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -670,10 +687,25 @@ class TTModelRunner:
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
 
-            # Update the cached states.
+            # A resumed request also invalidates deferred output identities if
+            # the worker did not see its earlier preemption notification.
+            if resumed_from_preemption:
+                req_state = preempt_cached_request_state(req_state)
+                self.requests[req_id] = req_state
+                removed_index = self.input_batch.remove_request(req_id)
+                if removed_index is not None:
+                    removed_req_indices.append(removed_index)
+                    persistent_batch_layout_changed = True
             apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                req_data.num_output_tokens[i],
+                req_data.all_token_ids.get(req_id),
             )
+            if req_id in accepted_counts:
+                acknowledge_request_outputs(req_state, accepted_counts[req_id])
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -1085,19 +1117,19 @@ class TTModelRunner:
         # - resumed-from-preemption requests (scheduled_cached_reqs with
         #   resumed_req_ids set) that need to replay tokens to rebuild KV,
         #   and/or
-        # - chunked-prefill continuations (cached requests that haven't
-        #   finished computing all their prompt tokens yet).
-        has_chunked_continuation = any(
-            input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
-            < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
+        # - chunked-prefill continuations, including previously generated
+        #   tokens replayed after the original prompt boundary. Track these
+        #   explicitly: a final one-token replay has the same computed/total
+        #   counts as ordinary decode but can share a batch with other prefills.
+        cached_prefill_req_ids = {
+            req_id
             for req_id in cached_reqs.req_ids
-            if req_id not in cached_reqs.resumed_req_ids
-        )
-        is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
-            or bool(cached_reqs.resumed_req_ids)
-            or has_chunked_continuation
-        )
+            if req_id in cached_reqs.resumed_req_ids
+            or req_id in self._chunked_prefill_req_ids
+            or input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
+            < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
+        }
+        is_prompt = bool(scheduler_output.scheduled_new_reqs or cached_prefill_req_ids)
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
@@ -1105,21 +1137,14 @@ class TTModelRunner:
             # cached on the worker", not necessarily "decode". During a prefill
             # step we can legitimately see cached requests if they are resumed
             # from preemption (still prefill work) or are chunked-prefill
-            # continuations (`num_computed < num_prompt_tokens` - still prefilling).
+            # continuations, even after all original prompt tokens are computed.
             if cached_reqs.num_reqs > 0:
                 any_decode_in_prefill = any(
-                    req_id not in cached_reqs.resumed_req_ids
-                    and input_batch.num_computed_tokens_cpu[
-                        input_batch.req_id_to_index[req_id]
-                    ]
-                    >= input_batch.num_prompt_tokens[
-                        input_batch.req_id_to_index[req_id]
-                    ]
+                    req_id not in cached_prefill_req_ids
                     for req_id in cached_reqs.req_ids
                 )
                 assert not any_decode_in_prefill, (
-                    "Prefill batch should not include decode cached requests "
-                    "(cached req_id that has finished its prompt)."
+                    "Prefill batch should not include decode cached requests."
                 )
 
             # num_computed_tokens for each request is the input position
@@ -1140,6 +1165,7 @@ class TTModelRunner:
                 dtype=np.int64,
             )
             prompt_lens = input_positions + chunk_lens
+            original_prompt_lens = input_batch.num_prompt_tokens[req_indices].tolist()
             intermediate_prefill_mask = torch.from_numpy(
                 prompt_lens < input_batch.num_tokens[req_indices]
             )
@@ -1155,6 +1181,7 @@ class TTModelRunner:
                 req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
+            original_prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
             reset_batch = self._decode_layout_changed_since_last_decode
@@ -1336,6 +1363,14 @@ class TTModelRunner:
         if is_prompt:
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
             slot_remap = None
+            self._chunked_prefill_req_ids.difference_update(row_req_ids)
+            self._chunked_prefill_req_ids.update(
+                req_id
+                for req_id, intermediate in zip(
+                    row_req_ids, intermediate_prefill_mask.tolist()
+                )
+                if intermediate
+            )
         else:
             prefill_empty_slots = None
             slot_remap = self._decode_state_slot_remap(row_req_ids)
@@ -1344,6 +1379,7 @@ class TTModelRunner:
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
+            original_prompt_lens=original_prompt_lens,
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
@@ -1758,6 +1794,7 @@ class TTModelRunner:
         slot_remap = None
         intermediate_prefill_mask = None
         prefill_empty_slots: list[int] | None = None
+        original_prompt_lens: list[int] | None = None
 
         if is_decode and isinstance(inputs, dict):
             # For decode, given gathered flattened tensors from all DP ranks.
@@ -1942,6 +1979,21 @@ class TTModelRunner:
             active_inputs: list[TTModelInput] = [mi for mi in inputs if mi]
             if not active_inputs:
                 raise ValueError("All inputs are None; nothing to concatenate")
+
+            # Prefill gather transports whole payloads. Keep original prompt
+            # boundaries in the same active-rank/row order as tokens, without
+            # adding entries for empty ranks or token-width padding.
+            if any(mi.original_prompt_lens is not None for mi in active_inputs):
+                original_prompt_lens = []
+                for mi in active_inputs:
+                    if (
+                        mi.original_prompt_lens is None
+                        or len(mi.original_prompt_lens) != mi.input_tokens.shape[0]
+                    ):
+                        raise ValueError(
+                            "DP prefill requires an original prompt length per row"
+                        )
+                    original_prompt_lens.extend(mi.original_prompt_lens)
 
             # Check if all ranks can sample on device.
             perform_device_sampling = all(
@@ -2150,6 +2202,7 @@ class TTModelRunner:
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
+            original_prompt_lens=original_prompt_lens,
             block_tables=block_tables,
             # ``block_tables_per_group`` carries each kv_cache_group's
             # block table merged across DP ranks (decode unpacks them
@@ -2709,6 +2762,16 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        if getattr(self.model, "supports_original_prompt_lens", False):
+            original_prompt_lens = model_input.original_prompt_lens
+            if (
+                original_prompt_lens is None
+                or len(original_prompt_lens) != (model_input.input_tokens.shape[0])
+            ):
+                raise ValueError(
+                    "Prefill requires an original prompt length per execution row"
+                )
+            kwargs["original_prompt_lens"] = original_prompt_lens
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {

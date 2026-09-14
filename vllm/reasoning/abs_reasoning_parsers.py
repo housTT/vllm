@@ -51,6 +51,15 @@ class ReasoningParser:
         return self.model_tokenizer.get_vocab()
 
     @abstractmethod
+    def adjust_request(self, request):
+        """Adjust a chat request before tokenization and sampling.
+
+        Parsers whose delimiters are special tokens need those tokens kept in
+        the decoded output (``skip_special_tokens=False``); the default keeps
+        the request unchanged. Mirrors ``ToolParser.adjust_request``.
+        """
+        return request
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.

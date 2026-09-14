@@ -1043,6 +1043,17 @@ class OpenAIServing:
                 tokenizer = renderer.get_tokenizer()
                 request = tool_parser(tokenizer).adjust_request(request=request)  # type: ignore[arg-type]
 
+        # The reasoning parser gets the same chance to adjust the request. A
+        # parser whose delimiters are special tokens must keep them in the
+        # decoded output, or it never sees the reasoning block at all and the
+        # whole thought is returned as content.
+        reasoning_parser_cls = getattr(self, "reasoning_parser_cls", None)
+        if reasoning_parser_cls is not None and isinstance(
+            request, ChatCompletionRequest | ResponsesRequest
+        ):
+            tokenizer = renderer.get_tokenizer()
+            request = reasoning_parser_cls(tokenizer).adjust_request(request)
+
         return conversation, [engine_prompt]
 
     def _extract_prompt_components(self, prompt: object):

@@ -25,7 +25,11 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm_tt_plugin.config import get_tt_config, get_tt_per_lane_max_num_seqs
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.scheduler import TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTSchedulingMode,
+    carry_scheduler_notifications,
+    has_connector_metadata,
+)
 
 logger = init_tt_logger(__name__)
 _T = TypeVar("_T")
@@ -337,6 +341,8 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             )
             else 0
         )
+        if getattr(self.scheduler, "_decode_after_empty_prefill", False):
+            local_prefill_intent = 0
         intent_tensor = torch.tensor([local_prefill_intent], dtype=torch.int32)
         self.dlog("before_intent_allreduce intent_tensor=%s", intent_tensor)
         dist.all_reduce(intent_tensor, op=dist.ReduceOp.MAX, group=self.dp_group)
@@ -365,13 +371,26 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             not request.is_prefill_chunk
             for request in getattr(self.scheduler, "running", [])
         )
-        # Both quantities are non-negative, so a single SUM answers both:
-        # zero total tokens, and zero iff no rank has a running decode.
-        probe_t = torch.tensor([local_tokens, int(local_has_decode)], dtype=torch.int32)
+        # SUM detects global token progress, runnable decodes, and opaque
+        # connector events. Deliver an event-bearing pass before rescheduling;
+        # there is no generic way to combine two connector metadata objects.
+        probe_t = torch.tensor(
+            [
+                local_tokens,
+                int(local_has_decode),
+                int(
+                    scheduler_output is not None
+                    and has_connector_metadata(scheduler_output)
+                ),
+            ],
+            dtype=torch.int32,
+        )
         dist.all_reduce(probe_t, op=dist.ReduceOp.SUM, group=self.dp_group)
-        global_tokens, ranks_with_decode = (int(v) for v in probe_t.tolist())
+        global_tokens, ranks_with_decode, ranks_with_metadata = (
+            int(v) for v in probe_t.tolist()
+        )
 
-        if global_tokens != 0 or ranks_with_decode == 0:
+        if global_tokens != 0 or ranks_with_decode == 0 or ranks_with_metadata:
             return scheduler_output
 
         self._dp_gather_forced_mode = TTSchedulingMode.DECODE_ONLY
@@ -386,11 +405,7 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
             return scheduler_output
 
         if scheduler_output is not None:
-            decode_output.finished_req_ids |= scheduler_output.finished_req_ids
-            decode_output.free_encoder_mm_hashes = (
-                scheduler_output.free_encoder_mm_hashes
-                + decode_output.free_encoder_mm_hashes
-            )
+            carry_scheduler_notifications(scheduler_output, decode_output)
 
         return decode_output
 

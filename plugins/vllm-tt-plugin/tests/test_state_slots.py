@@ -21,13 +21,18 @@ import torch
 from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
 SLOTS = 8
 
 
 def _runner(slots=SLOTS):
     """Fake runner: the state-slot map, the live-request set and the slot capacity."""
     return SimpleNamespace(
-        tt_per_lane_max_num_seqs=slots, _req_state_slot={}, requests={}
+        tt_per_lane_max_num_seqs=slots,
+        _req_state_slot={},
+        _chunked_prefill_req_ids=set(),
+        requests={},
     )
 
 
@@ -319,7 +324,21 @@ def test_preemption_releases_its_state_slot():
         r, finished=so.finished_req_ids, preempted=so.preempted_req_ids
     )
     r._req_state_slot.update({"P": 0, "KEEP": 1})
-    r.requests.update(dict.fromkeys(["P", "KEEP"]))
+    r.requests.update(
+        {
+            req_id: CachedRequestState(
+                req_id=req_id,
+                prompt_token_ids=[1],
+                mm_features=[],
+                sampling_params=None,
+                generator=None,
+                block_ids=([0],),
+                num_computed_tokens=1,
+                output_token_ids=[],
+            )
+            for req_id in ("P", "KEEP")
+        }
+    )
 
     TTModelRunner._update_states(r, _scheduler_output(preempted={"P"}))
 

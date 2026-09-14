@@ -130,3 +130,8 @@ class TTModelInput:
     # Prefill-only: rows whose forward contributes KV state but must not
     # consume a sampling RNG draw because more prompt tokens remain.
     intermediate_prefill_mask: torch.Tensor | None = None
+
+    # Prefill-only: original prompt boundary in active execution-row order.
+    # Unlike prompt_lens (the scheduled chunk end), this stays fixed when
+    # accepted generated tokens are replayed after preemption.
+    original_prompt_lens: list[int] | None = None

@@ -47,7 +47,11 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTScheduler,
+    TTSchedulingMode,
+    carry_scheduler_notifications,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -205,7 +209,7 @@ def merge_lane_scheduler_outputs(
             num_invalid_spec_tokens.update(out.num_invalid_spec_tokens)
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-    return SchedulerOutput(
+    merged = SchedulerOutput(
         scheduled_new_reqs=scheduled_new_reqs,
         scheduled_cached_reqs=cached,
         num_scheduled_tokens=num_scheduled_tokens,
@@ -220,6 +224,13 @@ def merge_lane_scheduler_outputs(
         pending_structured_output_tokens=pending_structured_output_tokens,
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
+    accepted_output_tokens = {
+        req_id: count
+        for out in lane_outputs
+        for req_id, count in getattr(out, "_tt_accepted_output_tokens", {}).items()
+    }
+    merged._tt_accepted_output_tokens = accepted_output_tokens
+    return merged
 
 
 class TTLaneCoordinator(SchedulerInterface):
@@ -511,17 +522,16 @@ class TTLaneCoordinator(SchedulerInterface):
             )
         ):
             # The discarded prefill pass already drained each lane's
-            # finished/freed-encoder bookkeeping; carry it onto the decode pass
-            # so the runner still releases that state.
-            carried_finished = merged.finished_req_ids
-            carried_free_encoder = merged.free_encoder_mm_hashes
+            # completion/preemption/encoder bookkeeping. Carry it per lane so
+            # both the runner and each lane's update path receive the events.
+            prefill_outputs = lane_outputs
             forced_mode = TTSchedulingMode.DECODE_ONLY
             lane_outputs = self._schedule_all_lanes(forced_mode)
+            for prefill_output, decode_output in zip(
+                prefill_outputs, lane_outputs, strict=True
+            ):
+                carry_scheduler_notifications(prefill_output, decode_output)
             merged = merge_lane_scheduler_outputs(lane_outputs)
-            merged.finished_req_ids |= carried_finished
-            merged.free_encoder_mm_hashes = (
-                carried_free_encoder + merged.free_encoder_mm_hashes
-            )
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
         plan = self._build_step_plan(lane_outputs, merged, is_decode)

@@ -81,6 +81,36 @@ class TTSchedulingMode(Enum):
         raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
+def has_connector_metadata(output: SchedulerOutput) -> bool:
+    return (
+        output.kv_connector_metadata is not None
+        or output.ec_connector_metadata is not None
+    )
+
+
+def carry_scheduler_notifications(
+    previous: SchedulerOutput, current: SchedulerOutput
+) -> None:
+    """Carry cleanup from an empty pass onto its replacement execution step.
+
+    Connector metadata is opaque and may consume load/save events when built.
+    Such a pass must be delivered separately, before scheduling a replacement.
+    """
+    assert previous.total_num_scheduled_tokens == 0
+    assert not has_connector_metadata(previous)
+    accepted = dict(getattr(previous, "_tt_accepted_output_tokens", {}))
+    accepted.update(getattr(current, "_tt_accepted_output_tokens", {}))
+    current._tt_accepted_output_tokens = accepted
+    current.finished_req_ids |= previous.finished_req_ids
+    current.free_encoder_mm_hashes = (
+        previous.free_encoder_mm_hashes + current.free_encoder_mm_hashes
+    )
+    if previous.preempted_req_ids:
+        current.preempted_req_ids = (
+            current.preempted_req_ids or set()
+        ) | previous.preempted_req_ids
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -120,6 +150,7 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._decode_after_empty_prefill = False
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -132,6 +163,23 @@ class TTScheduler(AsyncScheduler):
         base scheduler after the previous step).
         """
         return bool(self.waiting) or any(r.is_prefill_chunk for r in self.running)
+
+    def _prefill_retry_blocked(self, request: Request) -> bool:
+        retry = getattr(request, "_tt_prefill_retry", None)
+        if retry is None:
+            return False
+        free_blocks, resident_ids = retry
+        decode_ids = {r.request_id for r in self.running if not r.is_prefill_chunk}
+        # A finished/aborted/preempted resident or increased free capacity can
+        # make the failed continuation fit. A decode token alone cannot.
+        if (
+            not decode_ids
+            or not resident_ids.issubset(decode_ids)
+            or self.kv_cache_manager.block_pool.get_num_free_blocks() > free_blocks
+        ):
+            delattr(request, "_tt_prefill_retry")
+            return False
+        return True
 
     def schedule(self) -> SchedulerOutput:
         has_pending_prefill = self._has_pending_prefill()
@@ -150,6 +198,10 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result)
 
+        if self._decode_after_empty_prefill:
+            result = self._schedule_decode_only()
+            return self._finalize_scheduler_output(result)
+
         # Default mode:
         # Prefer prefill whenever there is pending prefill work - either new
         # requests in the waiting queue or partial-prefill continuations in
@@ -160,7 +212,10 @@ class TTScheduler(AsyncScheduler):
             # decode requests exist, fall back to decode-only so they can
             # advance and free capacity.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running:
+                if has_connector_metadata(prefill_result):
+                    return self._finalize_scheduler_output(prefill_result)
                 result = self._schedule_decode_only()
+                carry_scheduler_notifications(prefill_result, result)
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
@@ -171,6 +226,17 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
+        # Upstream num_output_tokens includes async placeholders. Workers need
+        # the accepted count separately to retire host RNG rollback checkpoints.
+        accepted_output_tokens = {
+            req_id: self.requests[req_id].num_output_tokens
+            for req_id in (
+                scheduler_output.num_scheduled_tokens.keys()
+                | (scheduler_output.preempted_req_ids or set())
+            )
+            if req_id in self.requests
+        }
+        scheduler_output._tt_accepted_output_tokens = accepted_output_tokens
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -184,6 +250,20 @@ class TTScheduler(AsyncScheduler):
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
+        saved_waiting = self.waiting
+        blocked_ids = {
+            r.request_id for r in saved_waiting if self._prefill_retry_blocked(r)
+        }
+        if blocked_ids:
+            self.waiting = create_request_queue(self.policy)
+            for request in saved_waiting:
+                if request.request_id not in blocked_ids:
+                    self.waiting.add_request(request)
+
+        # Capture before upstream resets computed tokens and preempts requests.
+        continuations = {
+            r.request_id: r for r in partial_prefills if r.num_computed_tokens > 0
+        }
         saved_max = self.max_num_running_reqs
         self.running = partial_prefills
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
@@ -192,6 +272,33 @@ class TTScheduler(AsyncScheduler):
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            if blocked_ids:
+                remaining_ids = {r.request_id for r in self.waiting}
+                original_ids = {r.request_id for r in saved_waiting}
+                saved_waiting.remove_requests(
+                    [
+                        r
+                        for r in saved_waiting
+                        if r.request_id not in remaining_ids | blocked_ids
+                    ]
+                )
+                # Restore deferred requests at their original queue positions;
+                # only new preemptions precede them (or use priority ordering).
+                for request in reversed(list(self.waiting)):
+                    if request.request_id not in original_ids:
+                        saved_waiting.prepend_request(request)
+                self.waiting = saved_waiting
+
+        if pure_decodes:
+            free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            resident_ids = frozenset(r.request_id for r in pure_decodes)
+            for req_id in result.preempted_req_ids or ():
+                if req_id in continuations:
+                    continuations[req_id]._tt_prefill_retry = free_blocks, resident_ids
+            if result.total_num_scheduled_tokens == 0 and has_connector_metadata(
+                result
+            ):
+                self._decode_after_empty_prefill = True
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -201,6 +308,7 @@ class TTScheduler(AsyncScheduler):
         so the base scheduler only sees decode-phase requests.  Preempted
         requests are merged back into the original waiting queue afterwards.
         """
+        self._decode_after_empty_prefill = False
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_waiting = self.waiting

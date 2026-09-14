@@ -44,6 +44,7 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
     """Zero global prefill progress falls back to decode when one exists."""
     prefill_output = SchedulerOutput.make_empty()
     prefill_output.finished_req_ids.add("finished-prefill")
+    prefill_output.preempted_req_ids = {"preempted-prefill"}
     prefill_output.free_encoder_mm_hashes.append("encoder-prefill")
     decode_output = SchedulerOutput.make_empty()
     decode_output.total_num_scheduled_tokens = 2
@@ -58,7 +59,7 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
 
     def all_reduce(tensor, *, op, group):
         all_reduce_calls.append(op)
-        tensor.copy_(engine_module.torch.tensor([0, 1]))
+        tensor.copy_(engine_module.torch.tensor([0, 1, 0]))
         assert group is core.dp_group
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
@@ -69,6 +70,7 @@ def test_dp_zero_prefill_falls_back_collectively(monkeypatch):
 
     assert result is decode_output
     assert result.finished_req_ids == {"finished-prefill"}
+    assert result.preempted_req_ids == {"preempted-prefill"}
     assert result.free_encoder_mm_hashes == ["encoder-prefill"]
     assert core._dp_gather_forced_mode == TTSchedulingMode.DECODE_ONLY
     assert all_reduce_calls == [engine_module.dist.ReduceOp.SUM]
@@ -87,7 +89,7 @@ def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch
     core = _core_with_scheduler(scheduler)
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor([0, 1]))
+        tensor.copy_(engine_module.torch.tensor([0, 1, 0]))
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
 
@@ -106,10 +108,10 @@ def test_dp_zero_prefill_fallback_keeps_output_when_rank_has_drained(monkeypatch
     [
         pytest.param(
             [SimpleNamespace(is_prefill_chunk=False)],
-            [1, 1],
+            [1, 1, 0],
             id="prefill-progress-on-any-rank",
         ),
-        pytest.param([], [0, 0], id="no-running-decode"),
+        pytest.param([], [0, 0, 0], id="no-running-decode"),
     ],
 )
 def test_dp_zero_prefill_no_fallback(monkeypatch, running, probe):
@@ -164,7 +166,7 @@ def test_dp_step_uses_decode_fallback_output(monkeypatch):
     executed = []
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor([0, 1]))
+        tensor.copy_(engine_module.torch.tensor([0, 1, 0]))
 
     monkeypatch.setattr(engine_module.dist, "all_reduce", all_reduce)
     monkeypatch.setattr(core, "_dp_any_rank_has_scheduler_requests", lambda: True)
@@ -221,7 +223,7 @@ def test_dp_async_step_submits_decode_after_prefill_fallback(monkeypatch):
     submitted = []
 
     def all_reduce(tensor, *, op, group):
-        tensor.copy_(engine_module.torch.tensor([0, 1]))
+        tensor.copy_(engine_module.torch.tensor([0, 1, 0]))
 
     def submit(output, grammar, *, overlap_ok):
         submitted.append((output, core._dp_gather_forced_mode, overlap_ok))

@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 _THOUGHT_PREFIX = "thought\n"
+_FENCED_THOUGHT_PREFIX = "```thought\n"
+_TOOL_CALL_START = "<|tool_call>"
 
 
 class Gemma4ReasoningParser(BaseThinkingReasoningParser):
@@ -83,24 +85,23 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         if reasoning is not None:
             reasoning = _strip_thought_label(reasoning)
 
-        # Gemma 4 may emit more than one thought block before its answer or
-        # tool call, e.g. a closed thought followed by an empty one. The base
-        # parser consumes a single start/end pair, so a later complete block
-        # would survive into ``content`` and leak the channel markers to the
-        # API. Consume every further complete block that leads the remaining
-        # content, keeping its reasoning, and hand back the rest byte for byte.
-        parts = [reasoning] if reasoning else []
-        while content is not None:
-            block, rest = _split_leading_thought_block(content, self.start_token, self.end_token)
-            if block is None:
-                break
-            block = _strip_thought_label(block)
-            if block:
-                parts.append(block)
-            content = rest or None
-
-        if parts:
-            reasoning = "\n".join(parts)
+        # Gemma 4 emits more than one thought block per turn: a closed thought
+        # followed by an empty one, or visible text followed by an empty block
+        # right before the tool call. The base parser consumes a single
+        # start/end pair, so every further block would reach the API as
+        # content. Consume each complete block in the text that precedes the
+        # first tool call, keep its reasoning, and leave the tool-call wire
+        # string byte for byte, so a quoted argument is never touched.
+        if content is not None:
+            head, sep, tail = content.partition(_TOOL_CALL_START)
+            extra, consumed_head = _consume_thought_blocks(head, self.start_token, self.end_token)
+            if consumed_head != head:
+                head = consumed_head.lstrip()
+            parts = [reasoning] if reasoning else []
+            parts.extend(extra)
+            if parts:
+                reasoning = "\n".join(parts)
+            content = (head + sep + tail) or None
         return reasoning, content
 
     def _reasoning_open(self, token_ids: Sequence[int]) -> bool:
@@ -221,21 +222,44 @@ def _rindex(values: Sequence[int], target: int) -> int | None:
     return None
 
 
-def _split_leading_thought_block(
-    text: str, start_token: str, end_token: str
-) -> tuple[str | None, str]:
-    """Split one complete thought block off the front of ``text``.
+def _consume_thought_blocks(text: str, start_token: str, end_token: str) -> tuple[list[str], str]:
+    """Remove every complete thought block from ``text``.
 
-    Only whitespace may precede the block, and it must be closed; anything else
-    is left untouched so ordinary content or a quoted tool argument that merely
-    resembles a marker is never removed. Returns ``(block_body, remainder)`` or
-    ``(None, text)`` when nothing was consumed.
+    Returns ``(reasoning_parts, remaining_text)``. A block that is opened but
+    never closed is left in place (the model may still be generating it). A
+    stray ``end_token`` with no opener closes a thought the model began without
+    the start token (seen as a markdown ``thought`` fence): the text before it
+    is reasoning. Empty blocks contribute no reasoning.
     """
-    stripped = text.lstrip()
-    if not stripped.startswith(start_token):
-        return None, text
-    body_start = len(start_token)
-    end_index = stripped.find(end_token, body_start)
-    if end_index == -1:
-        return None, text
-    return stripped[body_start:end_index], stripped[end_index + len(end_token) :]
+    parts: list[str] = []
+    remaining: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find(start_token, cursor)
+        end = text.find(end_token, cursor)
+        if end != -1 and (start == -1 or end < start):
+            # stray closer: everything since the cursor was thought text
+            body = _strip_thought_label(text[cursor:end].lstrip())
+            body = _strip_fenced_thought_label(body)
+            if body.strip():
+                parts.append(body.rstrip())
+            cursor = end + len(end_token)
+            continue
+        if start == -1:
+            break
+        close = text.find(end_token, start + len(start_token))
+        if close == -1:
+            break  # incomplete block: leave it
+        remaining.append(text[cursor:start])
+        body = _strip_thought_label(text[start + len(start_token) : close])
+        if body.strip():
+            parts.append(body.rstrip())
+        cursor = close + len(end_token)
+    remaining.append(text[cursor:])
+    return parts, "".join(remaining)
+
+
+def _strip_fenced_thought_label(text: str) -> str:
+    if text.startswith(_FENCED_THOUGHT_PREFIX):
+        return text[len(_FENCED_THOUGHT_PREFIX) :]
+    return text

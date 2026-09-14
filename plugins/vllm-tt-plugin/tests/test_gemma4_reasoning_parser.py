@@ -92,6 +92,54 @@ def test_two_nonempty_thought_blocks_are_joined():
     assert content == "done"
 
 
+def test_empty_block_after_visible_text_before_tool_call_is_removed():
+    # Observed 2026-09-14 (sympy__sympy-13551, turn 34): visible text, then an
+    # empty thought block immediately before the tool call.
+    parser = Gemma4ReasoningParser(_Tokenizer())
+    text = "I will investigate the method.\n\n"
+
+    reasoning, content = parser.extract_reasoning(_EMPTY_BLOCK + text + _EMPTY_BLOCK + _TOOL, request=None)
+
+    assert reasoning == ""
+    assert content == text + _TOOL
+
+
+def test_fenced_thought_with_stray_closer_becomes_reasoning():
+    # Observed 2026-09-14 (sympy__sympy-13551, turn 29): the model opened its
+    # thought with a markdown fence instead of the start token and closed it
+    # with a bare end token, then emitted an empty block and the tool call.
+    parser = Gemma4ReasoningParser(_Tokenizer())
+    thought = "```thought\nThe issue is in products.py.\nLet's remove it.\n"
+
+    reasoning, content = parser.extract_reasoning(
+        _EMPTY_BLOCK + thought + "<channel|>" + _EMPTY_BLOCK + _TOOL, request=None
+    )
+
+    assert reasoning == "The issue is in products.py.\nLet's remove it."
+    assert content == _TOOL
+
+
+def test_nonempty_block_between_text_keeps_surrounding_text():
+    parser = Gemma4ReasoningParser(_Tokenizer())
+
+    reasoning, content = parser.extract_reasoning(
+        "<|channel>thought\nplan<channel|>Step one.<|channel>thought\nre-check<channel|> Step two.", request=None
+    )
+
+    assert reasoning == "plan\nre-check"
+    assert content == "Step one. Step two."
+
+
+def test_markers_inside_tool_arguments_are_never_touched():
+    parser = Gemma4ReasoningParser(_Tokenizer())
+    tool = '<|tool_call>call:bash{command:<|"|>echo "<|channel>thought\\n<channel|>"<|"|>}<tool_call|>'
+
+    reasoning, content = parser.extract_reasoning(_EMPTY_BLOCK + "run it\n" + tool, request=None)
+
+    assert reasoning == ""
+    assert content == "run it\n" + tool
+
+
 def test_incomplete_later_block_is_left_in_content():
     parser = Gemma4ReasoningParser(_Tokenizer())
     tail = "<|channel>thought\nstill thinking"
@@ -102,14 +150,13 @@ def test_incomplete_later_block_is_left_in_content():
     assert content == tail
 
 
-def test_text_before_later_block_is_not_consumed():
+def test_block_after_text_is_removed_and_text_kept():
     parser = Gemma4ReasoningParser(_Tokenizer())
-    tail = "answer" + _EMPTY_BLOCK
 
-    reasoning, content = parser.extract_reasoning(_EMPTY_BLOCK + tail, request=None)
+    reasoning, content = parser.extract_reasoning(_EMPTY_BLOCK + "answer" + _EMPTY_BLOCK, request=None)
 
     assert reasoning == ""
-    assert content == tail
+    assert content == "answer"
 
 
 def test_content_ids_start_after_last_closed_block():

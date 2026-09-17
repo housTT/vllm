@@ -93,6 +93,11 @@ class HarmonyParser(DelegatingParser):
 
         # For error recovery
         self._current_message_tokens: list[int] = []
+        # Set once the token stream leaves the Harmony grammar mid-output (for
+        # example plain text where <|start|> was expected). From then on the rest
+        # of the output is surfaced as final-channel text instead of failing the
+        # request with a 500.
+        self._off_grammar = False
 
     @property
     def _harmony_parser(self) -> StreamableParser:
@@ -110,8 +115,53 @@ class HarmonyParser(DelegatingParser):
         self._num_processed_messages += 1
         return msg
 
+    def _reset_turn_state(self) -> None:
+        # Reset to the initial assistant-parser state for the next turn.
+        self._parser = None
+        self._num_processed_messages = 0
+        self._current_message_tokens.clear()
+        self._off_grammar = False
+
+    def _plain_text_segments(
+        self, token_ids: Sequence[int], *, completed: bool
+    ) -> list[Segment]:
+        """Surface tokens that cannot be parsed as Harmony as final-channel text.
+
+        The delta segment feeds the streaming path; the completed message (when
+        requested) feeds the non-streaming ``parse`` path, which only reads
+        completed messages.
+        """
+        if not token_ids:
+            return []
+        try:
+            text = self.model_tokenizer.decode(
+                list(token_ids), skip_special_tokens=True
+            )
+        except TypeError:
+            text = self.model_tokenizer.decode(list(token_ids))
+        if not text:
+            return []
+        segments = [
+            Segment(channel="final", recipient=None, delta=text, completed_message=None)
+        ]
+        if completed:
+            msg = Message.from_role_and_content(Role.ASSISTANT, text).with_channel(
+                "final"
+            )
+            segments.append(
+                Segment(
+                    channel="final", recipient=None, delta="", completed_message=msg
+                )
+            )
+        return segments
+
     def flush(self) -> list[Segment]:
         segments: list[Segment] = []
+        if self._off_grammar:
+            # Nothing structured is pending: the rest of the output was already
+            # surfaced as plain text when the grammar broke.
+            self._reset_turn_state()
+            return segments
         try:
             self._harmony_parser.process_eos()
             msg = self._poll_completed_message()
@@ -135,10 +185,7 @@ class HarmonyParser(DelegatingParser):
                 final_channel
             )
 
-        # Reset to the initial assistant-parser state for the next turn.
-        self._parser = None
-        self._num_processed_messages = 0
-        self._current_message_tokens.clear()
+        self._reset_turn_state()
 
         if msg is None:
             return segments
@@ -309,10 +356,43 @@ class HarmonyParser(DelegatingParser):
         if not token_ids:
             return ChunkResult(segments=[], reasoning_token_count=0)
 
+        if self._off_grammar:
+            # Streaming continuation after the grammar broke: plain text only.
+            return ChunkResult(
+                segments=self._plain_text_segments(token_ids, completed=False),
+                reasoning_token_count=0,
+            )
+
         segments: list[Segment] = []
         reasoning_token_count = 0
-        for token_id in token_ids:
-            self._harmony_parser.process(token_id)
+        for idx, token_id in enumerate(token_ids):
+            try:
+                self._harmony_parser.process(token_id)
+            except HarmonyError as e:
+                # The model wrote something the Harmony grammar does not allow
+                # here (seen on gpt-oss: a text token where <|start|> was
+                # expected after <|end|>). Keep every completed message, surface
+                # the current message and everything after it as plain text,
+                # and stop feeding the strict parser for this turn.
+                rest = self._current_message_tokens + list(token_ids[idx:])
+                try:
+                    bad = self.model_tokenizer.decode([token_id])
+                except Exception:  # noqa: BLE001
+                    bad = "?"
+                logger.warning(
+                    "Harmony parser rejected token %d (%r) after %d token(s) of "
+                    "the current message: %s. Surfacing the remaining %d token(s) "
+                    "of this output as plain text instead of failing the request.",
+                    token_id,
+                    bad,
+                    len(self._current_message_tokens),
+                    e,
+                    len(rest),
+                )
+                self._off_grammar = True
+                self._current_message_tokens.clear()
+                segments.extend(self._plain_text_segments(rest, completed=True))
+                break
             channel = self._harmony_parser.current_channel
             recipient = self._normalize_recipient(
                 self._harmony_parser.current_recipient

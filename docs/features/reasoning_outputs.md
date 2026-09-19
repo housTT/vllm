@@ -268,6 +268,30 @@ If `thinking_token_budget` is not specified, no explicit reasoning limit is appl
 !!! note
     `reasoning_end_str` can include a transition phrase before the reasoning end token. For example, setting `reasoning_end_str` to `"I have to give the solution based on the reasoning directly now.</think>"` instructs the model to emit that phrase when the budget is exhausted, making the reasoning termination more natural.
 
+### Harmony models (gpt-oss)
+
+gpt-oss has no reasoning end string: the model closes the `analysis` channel and
+opens the `final` channel with a token sequence, so the logits-level budget above
+does not apply. Chat completions for Harmony models instead keep part of
+`max_tokens` for the final channel. The request first runs with
+`max_tokens - reserve`; if it stops on `length` while still in the `analysis`
+channel, the server forces `<|end|><|start|>assistant<|channel|>final<|message|>`
+and continues in a follow-up engine request (prompt = original prompt + reasoning
+tokens + the switch) with the remaining budget, so `content` is not null. The total
+number of completion tokens never exceeds `max_tokens`.
+
+- `VLLM_HARMONY_FINAL_RESERVE_TOKENS`: `0` (default) reserves
+  `clamp(max_tokens // 8, 128, 1024)` tokens, a positive value fixes the reserve,
+  `-1` disables the feature.
+- `VLLM_HARMONY_FINAL_TRANSITION_TEXT`: optional text appended to the truncated
+  reasoning before the switch (empty by default).
+- `thinking_token_budget` on a request caps the first phase, i.e. the reasoning,
+  at that many tokens (it cannot be combined with `n>1`, logprobs, `ignore_eos`,
+  or a required/named `tool_choice`).
+
+`usage.completion_tokens_details.reasoning_tokens` reports the tokens spent in the
+`analysis` channel for every Harmony chat completion.
+
 ### Online Serving
 
 ```bash

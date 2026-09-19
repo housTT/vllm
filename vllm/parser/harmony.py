@@ -90,6 +90,9 @@ class HarmonyParser(DelegatingParser):
         self._parser: StreamableParser | None = None
         self._next_tool_call_index = 0
         self._num_processed_messages = 0
+        # Running count of reasoning tokens over the whole request (not reset
+        # per turn) so usage can report `completion_tokens_details`.
+        self._num_reasoning_tokens = 0
 
         # For error recovery
         self._current_message_tokens: list[int] = []
@@ -105,6 +108,10 @@ class HarmonyParser(DelegatingParser):
         if self._parser is None:
             self._parser = get_streamable_parser_for_assistant()
         return self._parser
+
+    @property
+    def num_reasoning_tokens(self) -> int:
+        return self._num_reasoning_tokens
 
     def _poll_completed_message(self) -> Message | None:
         messages = self._harmony_parser.messages
@@ -421,6 +428,7 @@ class HarmonyParser(DelegatingParser):
 
             # TODO: Optionally merge and suppress empty Segments
 
+        self._num_reasoning_tokens += reasoning_token_count
         return ChunkResult(
             segments=segments,
             reasoning_token_count=reasoning_token_count,

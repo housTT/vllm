@@ -857,3 +857,34 @@ class TestProcessChunk:
             ("analysis", "One"),
             ("final", "Two"),
         ]
+
+
+class TestNumReasoningTokens:
+    def test_counts_across_chunks_and_survives_flush(self, harmony_parser):
+        assert harmony_parser.num_reasoning_tokens == 0
+        first = harmony_parser.process_chunk(
+            encode_output("<|channel|>analysis<|message|>One two")
+        )
+        second = harmony_parser.process_chunk(
+            encode_output(
+                " three<|end|><|start|>assistant<|channel|>final<|message|>"
+                "Two<|return|>"
+            )
+        )
+        expected = first.reasoning_token_count + second.reasoning_token_count
+        assert expected > 0
+        assert harmony_parser.num_reasoning_tokens == expected
+        harmony_parser.flush()
+        assert harmony_parser.num_reasoning_tokens == expected
+
+    def test_parse_populates_count(self, harmony_parser, chat_request):
+        token_ids = encode_output(
+            "<|channel|>analysis<|message|>Think hard<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>Answer<|return|>"
+        )
+        reasoning, content, _ = harmony_parser.parse(
+            "", chat_request, model_output_token_ids=token_ids
+        )
+        assert reasoning == "Think hard"
+        assert content == "Answer"
+        assert 0 < harmony_parser.num_reasoning_tokens < len(token_ids)

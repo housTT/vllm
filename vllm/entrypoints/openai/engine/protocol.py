@@ -112,11 +112,19 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     request has no multimodal input."""
 
 
+class CompletionTokenUsageInfo(OpenAIBaseModel):
+    reasoning_tokens: int | None = None
+    """Completion tokens spent in the reasoning channel, when the parser can
+    tell them apart (Harmony `analysis` messages). Already counted in
+    `completion_tokens`."""
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    completion_tokens_details: CompletionTokenUsageInfo | None = None
 
 
 class PerRequestTimingMetrics(OpenAIBaseModel):

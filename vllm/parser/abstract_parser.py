@@ -155,6 +155,15 @@ class Parser:
         self._reasoning_parser = parser
 
     @property
+    def num_reasoning_tokens(self) -> int | None:
+        """Output tokens this parser has attributed to reasoning so far.
+
+        ``None`` when the parser cannot count them (the default); token-based
+        parsers such as Harmony override this.
+        """
+        return None
+
+    @property
     def tool_parser(self) -> ToolParser | None:
         """The underlying tool parser, if any."""
         return self._tool_parser

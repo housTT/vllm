@@ -247,6 +247,8 @@ if TYPE_CHECKING:
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
+    VLLM_HARMONY_FINAL_RESERVE_TOKENS: int = 0
+    VLLM_HARMONY_FINAL_TRANSITION_TEXT: str = ""
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
@@ -1795,6 +1797,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # temperature=0). Set to an ISO date string, e.g. "2023-09-12",
     # for reproducible inference or testing.
     "VLLM_SYSTEM_START_DATE": lambda: os.getenv("VLLM_SYSTEM_START_DATE", None),
+    # Harmony (gpt-oss) chat completions: keep part of `max_tokens` for the
+    # final channel. When the analysis (reasoning) channel is still open at
+    # the reserve boundary the server forces the switch to the final channel
+    # and continues in a follow-up request, so `content` is not null.
+    # 0 (default): automatic reserve, clamp(max_tokens // 8, 128, 1024).
+    # >0: fixed number of reserved tokens. -1: disabled.
+    "VLLM_HARMONY_FINAL_RESERVE_TOKENS": lambda: int(
+        os.getenv("VLLM_HARMONY_FINAL_RESERVE_TOKENS", "0")
+    ),
+    # Optional text appended to the truncated analysis message before the
+    # forced switch to the final channel (e.g. "I must answer now."). Empty by
+    # default: the switch is purely structural.
+    "VLLM_HARMONY_FINAL_TRANSITION_TEXT": lambda: os.getenv(
+        "VLLM_HARMONY_FINAL_TRANSITION_TEXT", ""
+    ),
     # Enable automatic retry when tool call JSON parsing fails
     # If enabled, returns an error message to the model to retry
     # If disabled (default), raises an exception and fails the request

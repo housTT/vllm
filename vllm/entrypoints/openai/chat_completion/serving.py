@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 import io
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import Any, Final, cast
@@ -26,6 +27,16 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.openai.chat_completion.harmony_final_reserve import (
+    FinalReservePlan,
+    HarmonyChannelTracker,
+    make_forced_delta,
+    make_terminal_length_output,
+    merge_final_outputs,
+    plan_final_reserve,
+    rebase_output,
+    strip_finish,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -39,6 +50,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatMessage,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    CompletionTokenUsageInfo,
     DeltaMessage,
     ErrorResponse,
     FunctionCall,
@@ -54,15 +66,20 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
-from vllm.inputs import EngineInput, MultiModalPlaceholders
+from vllm.inputs import EngineInput, MultiModalPlaceholders, tokens_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
+from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.renderers import ChatParams
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import (
+    BeamSearchParams,
+    RequestOutputKind,
+    SamplingParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tool_parser
@@ -156,6 +173,24 @@ def _make_prompt_tokens_details(
         created_cache_tokens=num_cache_creation_tokens,
         multimodal_tokens=mm_token_counts or None,
     )
+
+
+def _make_completion_tokens_details(
+    parsers: GenericSequence[Parser | None],
+) -> CompletionTokenUsageInfo | None:
+    """Build ``completion_tokens_details`` from the parsers' reasoning counts.
+
+    ``None`` unless at least one parser can attribute tokens to reasoning
+    (Harmony does; text-based parsers do not count tokens).
+    """
+    counts = [
+        count
+        for parser in parsers
+        if parser is not None and (count := parser.num_reasoning_tokens) is not None
+    ]
+    if not counts:
+        return None
+    return CompletionTokenUsageInfo(reasoning_tokens=sum(counts))
 
 
 class OpenAIServingChat(GenerateBaseServing):
@@ -375,6 +410,30 @@ class OpenAIServingChat(GenerateBaseServing):
                     self.default_sampling_params,
                 )
 
+            final_reserve_plan: FinalReservePlan | None = None
+            if (
+                isinstance(sampling_params, SamplingParams)
+                and self.online_renderer.use_harmony
+            ):
+                # The engine has no reasoning-token budget for Harmony models
+                # (the gpt-oss reasoning parser exposes no start/end strings),
+                # so the request-level `thinking_token_budget` is applied here
+                # through the final-channel reserve and must not reach the
+                # engine, which would reject it.
+                thinking_token_budget = sampling_params.thinking_token_budget
+                sampling_params.thinking_token_budget = None
+                final_reserve_plan = plan_final_reserve(
+                    request, sampling_params, thinking_token_budget, tokenizer
+                )
+                if final_reserve_plan is None and thinking_token_budget is not None:
+                    return self.create_error_response(
+                        "thinking_token_budget is applied through the "
+                        "final-channel reserve on Harmony models and cannot be "
+                        "combined with n>1, logprobs, ignore_eos, a required or "
+                        "named tool_choice, a disabled reserve, a budget of 0, "
+                        "or a max_tokens below twice the reserve."
+                    )
+
             self._log_inputs(
                 sub_request_id,
                 engine_input,
@@ -397,33 +456,41 @@ class OpenAIServingChat(GenerateBaseServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
-                    reasoning_ended = True
-                elif request._grammar_from_tool_parser:
-                    # The Mistral grammar already includes an optional
-                    # `think?` rule that handles both reasoning and
-                    # non-reasoning outputs.
-                    reasoning_ended = True
-                elif parser is not None and parser.reasoning_parser is not None:
-                    reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])
-                else:
-                    reasoning_ended = None
-
-                generator = self.engine_client.generate(
-                    engine_input,
-                    sampling_params,
-                    sub_request_id,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
-                    data_parallel_rank=data_parallel_rank,
-                    reasoning_ended=reasoning_ended,
-                    reasoning_parser_kwargs={
-                        "chat_template_kwargs": chat_template_kwargs,
-                    }
+                reasoning_parser_kwargs = (
+                    {"chat_template_kwargs": chat_template_kwargs}
                     if parser is not None and parser.reasoning_parser is not None
-                    else None,
+                    else None
                 )
+                if final_reserve_plan is not None:
+                    generator = self._generate_with_final_reserve(
+                        engine_input,
+                        sampling_params,
+                        sub_request_id,
+                        request=request,
+                        parser=parser,
+                        plan=final_reserve_plan,
+                        prompt_token_ids=list(prompt_token_ids or []),
+                        tokenizer=tokenizer,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                        reasoning_parser_kwargs=reasoning_parser_kwargs,
+                    )
+                else:
+                    generator = self.engine_client.generate(
+                        engine_input,
+                        sampling_params,
+                        sub_request_id,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                        reasoning_ended=self._reasoning_ended(
+                            request, parser, prompt_token_ids
+                        ),
+                        reasoning_parser_kwargs=reasoning_parser_kwargs,
+                    )
 
             generators.append(generator)
 
@@ -454,6 +521,170 @@ class OpenAIServingChat(GenerateBaseServing):
             parser=parser,
             mm_token_counts=mm_token_counts,
         )
+
+    @staticmethod
+    def _reasoning_ended(
+        request: ChatCompletionRequest,
+        parser: Parser | None,
+        prompt_token_ids: list[int] | None,
+    ) -> bool | None:
+        """Whether the prompt already ends the reasoning section.
+
+        Passed to the engine so structured-output grammars know when to start
+        constraining the output.
+        """
+        if not request.include_reasoning:
+            return True
+        if request._grammar_from_tool_parser:
+            # The Mistral grammar already includes an optional
+            # `think?` rule that handles both reasoning and
+            # non-reasoning outputs.
+            return True
+        if parser is not None and parser.reasoning_parser is not None:
+            return parser.is_reasoning_end(prompt_token_ids or [])
+        return None
+
+    async def _generate_with_final_reserve(
+        self,
+        engine_input: EngineInput,
+        sampling_params: SamplingParams,
+        request_id: str,
+        *,
+        request: ChatCompletionRequest,
+        parser: Parser | None,
+        plan: FinalReservePlan,
+        prompt_token_ids: list[int],
+        tokenizer: TokenizerLike,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        priority: int,
+        data_parallel_rank: int | None,
+        reasoning_parser_kwargs: dict[str, Any] | None,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Generate with part of ``max_tokens`` reserved for the final channel.
+
+        Phase 1 runs the request with ``plan.phase1_max_tokens``. If it stops
+        on ``length`` inside a Harmony message body, phase 2 continues it in a
+        new engine request whose prompt is the original prompt plus the phase-1
+        output (plus the forced switch to the final channel when the analysis
+        channel was still open). Phase-2 outputs are re-based so the caller
+        sees one continuous request. See ``harmony_final_reserve``.
+        """
+        streaming = sampling_params.output_kind == RequestOutputKind.DELTA
+        common_kwargs: dict[str, Any] = dict(
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            reasoning_parser_kwargs=reasoning_parser_kwargs,
+        )
+
+        params_1 = copy.copy(sampling_params)
+        params_1.max_tokens = plan.phase1_max_tokens
+
+        tracker = HarmonyChannelTracker()
+        phase1_ids: list[int] = []
+        phase1_res: RequestOutput | None = None
+        async for res in self.engine_client.generate(
+            engine_input,
+            params_1,
+            request_id,
+            reasoning_ended=self._reasoning_ended(request, parser, prompt_token_ids),
+            **common_kwargs,
+        ):
+            if res.outputs:
+                output = res.outputs[0]
+                tracker.feed(output.token_ids)
+                if streaming:
+                    phase1_ids.extend(output.token_ids)
+                else:
+                    phase1_ids = list(output.token_ids)
+            if not res.finished:
+                yield res
+                continue
+            phase1_res = res
+
+        if phase1_res is None:
+            return
+
+        forced: list[int] | None = None
+        if phase1_res.outputs and phase1_res.outputs[0].finish_reason == "length":
+            forced = tracker.forced_continuation_ids(plan.transition_ids)
+        remaining = (
+            plan.max_tokens - len(phase1_ids) - len(forced) if forced is not None else 0
+        )
+        if forced is None or remaining <= 0:
+            yield phase1_res
+            return
+
+        request_id_2 = f"{request_id}-final"
+        logger.info(
+            "Harmony final reserve: request %s reached its phase-1 cap of %d "
+            "tokens inside the %r channel after %d output tokens; %s with %d "
+            "tokens left as %s.",
+            request_id,
+            plan.phase1_max_tokens,
+            tracker.channel,
+            len(phase1_ids),
+            "forcing the final channel" if forced else "continuing the message",
+            remaining,
+            request_id_2,
+        )
+        forced_text = (
+            tokenizer.decode(
+                forced, skip_special_tokens=sampling_params.skip_special_tokens
+            )
+            if forced
+            else ""
+        )
+
+        if streaming:
+            yield strip_finish(phase1_res)
+            if forced:
+                yield make_forced_delta(phase1_res, forced, forced_text)
+
+        prompt_2 = [*prompt_token_ids, *phase1_ids, *forced]
+        engine_input_2 = tokens_input(
+            prompt_2, cache_salt=cast(dict[str, Any], engine_input).get("cache_salt")
+        )
+        params_2 = copy.copy(sampling_params)
+        params_2.max_tokens = remaining
+        self._log_inputs(
+            request_id_2, engine_input_2, params=params_2, lora_request=lora_request
+        )
+
+        produced = False
+        try:
+            async for res2 in self.engine_client.generate(
+                engine_input_2,
+                params_2,
+                request_id_2,
+                # Phase 2 always starts inside the answer (final or plain
+                # commentary message), so grammars apply from its first token.
+                reasoning_ended=True,
+                **common_kwargs,
+            ):
+                produced = True
+                if streaming:
+                    yield rebase_output(res2, phase1_res, request_id)
+                elif res2.finished:
+                    yield merge_final_outputs(
+                        phase1_res, forced, forced_text, res2, request_id
+                    )
+        except ValueError as e:
+            if produced:
+                raise
+            logger.warning(
+                "Harmony final reserve: continuation %s was not accepted (%s); "
+                "returning the truncated phase-1 output of %s.",
+                request_id_2,
+                e,
+                request_id,
+            )
+            if streaming:
+                yield make_terminal_length_output(phase1_res)
+            else:
+                yield phase1_res
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
@@ -803,6 +1034,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
+            completion_tokens_details = _make_completion_tokens_details(parsers)
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
@@ -816,6 +1048,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     num_cache_creation_tokens,
                     mm_token_counts,
                 )
+                final_usage.completion_tokens_details = completion_tokens_details
 
                 # In streaming, metrics ride on this final usage chunk, which is
                 # only emitted when usage reporting is enabled (i.e.
@@ -853,6 +1086,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
+                completion_tokens_details=completion_tokens_details,
             )
 
             # Log complete streaming response if output logging is enabled
@@ -1099,6 +1333,7 @@ class OpenAIServingChat(GenerateBaseServing):
             final_res.num_cache_creation_tokens,
             mm_token_counts,
         )
+        usage.completion_tokens_details = _make_completion_tokens_details([parser])
 
         request_metadata.final_usage_info = usage
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar, Iterable
@@ -114,20 +115,25 @@ def carry_scheduler_notifications(
 
 
 # Free KV blocks kept per resident sequence when admitting new prompts (see
-# ``TTScheduler._admission_blocked_ids``). 4 blocks is 512 decode tokens of
-# full-attention growth at a 128-token block. ``additional_config.tt.
-# kv_admission_reserve_blocks_per_seq`` overrides it; 0 disables the guard.
-DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ = 4
+# ``TTScheduler._admission_blocked_ids``). By default one block per KV cache
+# group plus two: residents whose prompts have the same length cross block
+# boundaries in lockstep, and under async scheduling each group allocates its
+# next block one step before the sliding manager frees the page behind the
+# window, so a step can take ``groups`` blocks per resident before anything
+# comes back. ``additional_config.tt.kv_admission_reserve_blocks_per_seq``
+# overrides the value; 0 disables the guard.
+ADMISSION_RESERVE_EXTRA_BLOCKS_PER_SEQ = 2
 
 
-def _admission_reserve_blocks_per_seq(vllm_config) -> int:
+def _admission_reserve_blocks_per_seq(vllm_config) -> int | None:
+    """The configured reserve, or None for the per-group default."""
     if vllm_config is None:
-        return DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ
+        return None
     try:
         value = get_tt_config(vllm_config).get("kv_admission_reserve_blocks_per_seq")
     except Exception:  # pragma: no cover - config stand-ins without additional_config
         value = None
-    return DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ if value is None else int(value)
+    return None if value is None else int(value)
 
 
 class TTScheduler(AsyncScheduler):
@@ -201,13 +207,17 @@ class TTScheduler(AsyncScheduler):
         needs for its whole prompt leave ``reserve_per_seq`` free blocks per
         resident (plus the newly admitted ones) for decode growth.
         """
+        manager = self.kv_cache_manager
         per_seq = getattr(self, "_admission_reserve_blocks_per_seq", None)
         if per_seq is None:
             per_seq = _admission_reserve_blocks_per_seq(getattr(self, "vllm_config", None))
+        if per_seq is None:
+            per_seq = (
+                len(manager.coordinator.single_type_managers) + ADMISSION_RESERVE_EXTRA_BLOCKS_PER_SEQ
+            )
             self._admission_reserve_blocks_per_seq = per_seq
         if per_seq <= 0:
             return set()
-        manager = self.kv_cache_manager
         free = manager.block_pool.get_num_free_blocks()
         admitted = 0
         blocked: set[str] = set()
@@ -219,6 +229,15 @@ class TTScheduler(AsyncScheduler):
                 continue
             free -= need
             admitted += 1
+        if blocked and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV admission reserve: residents=%d admitted=%d held=%d free_after=%d reserve_per_seq=%d",
+                num_residents,
+                admitted,
+                len(blocked),
+                free,
+                per_seq,
+            )
         return blocked
 
     def _resident_footprint_blocks(self, num_tokens: int) -> int:
@@ -331,9 +350,12 @@ class TTScheduler(AsyncScheduler):
         blocked_ids = {
             r.request_id for r in saved_waiting if self._prefill_retry_blocked(r)
         }
+        # Every running request counts as a resident, including prompts still
+        # in flight (``is_prefill_chunk``): their blocks are already allocated
+        # and they will grow like any other resident.
         blocked_ids |= self._admission_blocked_ids(
             (r for r in saved_waiting if r.request_id not in blocked_ids),
-            len(pure_decodes),
+            len(pure_decodes) + len(partial_prefills),
         )
         if blocked_ids:
             self.waiting = create_request_queue(self.policy)

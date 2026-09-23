@@ -202,6 +202,8 @@ exec(
     ),
     g,
 )
+g["logging"] = __import__("logging")
+g["logger"] = N(isEnabledFor=lambda level: False, debug=lambda *a, **k: None)
 TT = extract(tt, "TTScheduler", bases=["AsyncScheduler"])
 # The CPU control exercises the retry guard and preemption paths under deliberate
 # KV pressure; the admission reserve would hold those prompts back, so it is off.

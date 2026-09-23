@@ -123,8 +123,20 @@ def test_queue_order_is_respected():
 
 
 def test_reserve_knob_defaults_and_reads_tt_config():
-    assert _admission_reserve_blocks_per_seq(None) == 4
+    assert _admission_reserve_blocks_per_seq(None) is None
     cfg = SimpleNamespace(additional_config={"tt": {"kv_admission_reserve_blocks_per_seq": 0}})
     assert _admission_reserve_blocks_per_seq(cfg) == 0
     cfg = SimpleNamespace(additional_config={"tt": {"kv_admission_reserve_blocks_per_seq": 8}})
     assert _admission_reserve_blocks_per_seq(cfg) == 8
+
+
+def test_default_reserve_is_one_block_per_group_plus_two():
+    manager = _manager(1509)
+    stub = TTScheduler.__new__(TTScheduler)
+    stub.kv_cache_manager = manager
+    stub.vllm_config = SimpleNamespace(additional_config={})
+    waiting = [_request(f"r{i}", 1050) for i in range(32)]
+    blocked = stub._admission_blocked_ids(waiting, 0)
+    # 6 groups -> 8 blocks per resident: 14 x 94 = 1,316 admitted leaves 193 >= 8 x 14; a 15th would leave 99 < 120.
+    assert stub._admission_reserve_blocks_per_seq == 8
+    assert 32 - len(blocked) == 14

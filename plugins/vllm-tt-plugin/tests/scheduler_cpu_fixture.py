@@ -203,6 +203,9 @@ exec(
     g,
 )
 TT = extract(tt, "TTScheduler", bases=["AsyncScheduler"])
+# The CPU control exercises the retry guard and preemption paths under deliberate
+# KV pressure; the admission reserve would hold those prompts back, so it is off.
+TT._admission_reserve_blocks_per_seq = 0
 
 
 class Request(N):

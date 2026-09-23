@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -362,11 +363,20 @@ class TTModelRunner:
 
         # The block tables in the persistent input batch have
         # max_num_blocks_per_req = cdiv(max_model_len, block_size) but this
-        # does not take into account num blocks in KV cache. Actual max is
-        # min of these two. Used to slice block tables during input prep.
-        self.max_num_blocks_per_req = min(
-            cdiv(max_model_len, self.cache_config.block_size),
+        # does not take into account num blocks in KV cache. For a single
+        # full-attention group the actual max is the min of these two, and
+        # the table is sliced to it during input prep. A hybrid config with
+        # a sliding-window group must keep the full width: vLLM's sliding
+        # manager addresses a request's table by absolute virtual block
+        # (position // block_size) and reclaims old pages in place, so a
+        # request can legitimately reach column ``cdiv(max_model_len,
+        # block_size) - 1`` while holding far fewer blocks than that, and
+        # slicing the table to ``num_blocks`` truncates its history.
+        self.max_num_blocks_per_req = self._max_num_blocks_per_req(
+            max_model_len,
+            self.cache_config.block_size,
             kv_cache_config.num_blocks,
+            kv_cache_groups,
         )
 
         # Number of kv_cache_groups; needed by DP gather/merge to pack
@@ -403,6 +413,25 @@ class TTModelRunner:
             return
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+
+    @staticmethod
+    def _max_num_blocks_per_req(
+        max_model_len: int, block_size: int, num_blocks: int, kv_cache_groups: list
+    ) -> int:
+        """Width of the per-request block table handed to the model.
+
+        A single full-attention group never addresses more blocks than the
+        pool holds, so the table is trimmed to ``min(cdiv(max_model_len,
+        block_size), num_blocks)``. A config with a sliding-window group keeps
+        the full ``cdiv(max_model_len, block_size)`` width: upstream's sliding
+        manager indexes that group's table by absolute virtual block and
+        reclaims old pages in place, so a request that holds only a window's
+        worth of blocks still reaches the last column.
+        """
+        full_width = cdiv(max_model_len, block_size)
+        if any(isinstance(g.kv_cache_spec, SlidingWindowSpec) for g in kv_cache_groups):
+            return full_width
+        return min(full_width, num_blocks)
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:

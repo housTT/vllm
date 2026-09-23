@@ -3,12 +3,14 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar
+from typing import ClassVar, Iterable
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
+from vllm_tt_plugin.config import get_tt_config
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
@@ -111,6 +113,23 @@ def carry_scheduler_notifications(
         ) | previous.preempted_req_ids
 
 
+# Free KV blocks kept per resident sequence when admitting new prompts (see
+# ``TTScheduler._admission_blocked_ids``). 4 blocks is 512 decode tokens of
+# full-attention growth at a 128-token block. ``additional_config.tt.
+# kv_admission_reserve_blocks_per_seq`` overrides it; 0 disables the guard.
+DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ = 4
+
+
+def _admission_reserve_blocks_per_seq(vllm_config) -> int:
+    if vllm_config is None:
+        return DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ
+    try:
+        value = get_tt_config(vllm_config).get("kv_admission_reserve_blocks_per_seq")
+    except Exception:  # pragma: no cover - config stand-ins without additional_config
+        value = None
+    return DEFAULT_ADMISSION_RESERVE_BLOCKS_PER_SEQ if value is None else int(value)
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -151,6 +170,9 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._decode_after_empty_prefill = False
+        self._admission_reserve_blocks_per_seq = _admission_reserve_blocks_per_seq(
+            getattr(self, "vllm_config", None)
+        )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -163,6 +185,61 @@ class TTScheduler(AsyncScheduler):
         base scheduler after the previous step).
         """
         return bool(self.waiting) or any(r.is_prefill_chunk for r in self.running)
+
+    def _admission_blocked_ids(
+        self, waiting: Iterable[Request], num_residents: int
+    ) -> set[str]:
+        """Waiting requests to hold back so residents keep room to grow.
+
+        Upstream admits new prompts down to the last free block and relies on
+        preempt-and-recompute when a running request later needs a block. On
+        TT a preemption is expensive: the request is replayed token by token
+        and the decode traces are released and recaptured, so a pool filled to
+        the brim by same-length prompts (all crossing block boundaries in
+        lockstep) turns into a preempt/replay cycle with near-zero output.
+        Walk the queue in order, admitting only while the blocks the request
+        needs for its whole prompt leave ``reserve_per_seq`` free blocks per
+        resident (plus the newly admitted ones) for decode growth.
+        """
+        per_seq = getattr(self, "_admission_reserve_blocks_per_seq", None)
+        if per_seq is None:
+            per_seq = _admission_reserve_blocks_per_seq(getattr(self, "vllm_config", None))
+            self._admission_reserve_blocks_per_seq = per_seq
+        if per_seq <= 0:
+            return set()
+        manager = self.kv_cache_manager
+        free = manager.block_pool.get_num_free_blocks()
+        admitted = 0
+        blocked: set[str] = set()
+        for request in waiting:
+            need = self._resident_footprint_blocks(request.num_tokens)
+            reserve = per_seq * (num_residents + admitted + 1)
+            if free - need < reserve:
+                blocked.add(request.request_id)
+                continue
+            free -= need
+            admitted += 1
+        return blocked
+
+    def _resident_footprint_blocks(self, num_tokens: int) -> int:
+        """Blocks a request holds once ``num_tokens`` are computed.
+
+        Chunked prefill allocates a prompt incrementally and the sliding-window
+        manager frees pages behind the window as it goes, so the steady footprint
+        (not the whole-prompt block count) is what the pool must hold: every
+        block of the prompt for a full-attention group, the window plus one
+        block for a sliding-window group, and the manager's own estimate for
+        anything else.
+        """
+        total = 0
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            block_size = manager.block_size
+            blocks = cdiv(num_tokens, block_size)
+            window = getattr(manager, "sliding_window", None)
+            if window is not None:
+                blocks = min(blocks, cdiv(window - 1, block_size) + 1)
+            total += blocks
+        return total
 
     def _prefill_retry_blocked(self, request: Request) -> bool:
         retry = getattr(request, "_tt_prefill_retry", None)
@@ -254,6 +331,10 @@ class TTScheduler(AsyncScheduler):
         blocked_ids = {
             r.request_id for r in saved_waiting if self._prefill_retry_blocked(r)
         }
+        blocked_ids |= self._admission_blocked_ids(
+            (r for r in saved_waiting if r.request_id not in blocked_ids),
+            len(pure_decodes),
+        )
         if blocked_ids:
             self.waiting = create_request_queue(self.policy)
             for request in saved_waiting:

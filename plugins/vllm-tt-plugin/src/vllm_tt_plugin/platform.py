@@ -827,11 +827,20 @@ class TTPlatform(Platform):
                 )
                 _renormalize_mamba_cache_config(vllm_config)
             else:
-                # Check if the model architecture uses sliding window
+                # A sliding-window model must also declare that its prefill
+                # honours a cached prefix on the sliding layers: the model has
+                # to rebuild the last window from the retained pages (upstream's
+                # sliding manager keeps ``cdiv(window - 1, block) + 1`` blocks
+                # of history for a hit) before it appends the new chunk.
                 uses_sliding_window = (
                     vllm_config.model_config.get_sliding_window() is not None
                 )
-                if uses_sliding_window:
+                sliding_prefix_ok = bool(
+                    model_capabilities.get("supports_prefix_caching_sliding_window", False)
+                    if model_capabilities
+                    else False
+                )
+                if uses_sliding_window and not sliding_prefix_ok:
                     vllm_config.cache_config.enable_prefix_caching = False
                     logger.warning(
                         "Prefix caching is not supported in TT backend for "

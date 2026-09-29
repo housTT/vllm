@@ -610,6 +610,7 @@ class OpenAIServingChat(GenerateBaseServing):
         forced: list[int] | None = None
         if phase1_res.outputs and phase1_res.outputs[0].finish_reason == "length":
             forced = tracker.forced_continuation_ids(plan.transition_ids)
+        phase2_in_body = tracker.in_message_body or bool(forced)
         remaining = (
             plan.max_tokens - len(phase1_ids) - len(forced) if forced is not None else 0
         )
@@ -626,7 +627,15 @@ class OpenAIServingChat(GenerateBaseServing):
             plan.phase1_max_tokens,
             tracker.channel,
             len(phase1_ids),
-            "forcing the final channel" if forced else "continuing the message",
+            (
+                ("forcing the final channel" if forced else "continuing the message")
+                if tracker.in_message_body
+                else (
+                    "completing the switch to the final channel"
+                    if forced
+                    else "continuing the message header"
+                )
+            ),
             remaining,
             request_id_2,
         )
@@ -659,9 +668,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 engine_input_2,
                 params_2,
                 request_id_2,
-                # Phase 2 always starts inside the answer (final or plain
-                # commentary message), so grammars apply from its first token.
-                reasoning_ended=True,
+                reasoning_ended=phase2_in_body,
                 **common_kwargs,
             ):
                 produced = True

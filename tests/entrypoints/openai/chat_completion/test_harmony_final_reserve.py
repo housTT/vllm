@@ -226,13 +226,34 @@ class TestChannelTracker:
         assert tracker.channel == "final"
         assert tracker.forced_continuation_ids() == []
 
-    def test_header_and_tool_call_pass_through(self):
+    def test_end_of_analysis_forces_the_rest_of_the_switch(self):
+        tracker = HarmonyChannelTracker()
+        tracker.feed(encode(ANALYSIS_OPEN + "Think.<|end|>"))
+        assert tracker.forced_continuation_ids([1, 2]) == FORCED[1:]
+
+    def test_final_header_is_completed(self):
         tracker = HarmonyChannelTracker()
         tracker.feed(
             encode(ANALYSIS_OPEN + "Think.<|end|><|start|>assistant<|channel|>")
         )
-        assert tracker.forced_continuation_ids() is None
+        assert tracker.forced_continuation_ids() == FORCED[4:]
 
+        tracker = HarmonyChannelTracker()
+        tracker.feed(
+            encode(ANALYSIS_OPEN + "Think.<|end|><|start|>assistant<|channel|>final")
+        )
+        assert tracker.forced_continuation_ids() == FORCED[5:]
+
+    def test_other_header_continues_in_place(self):
+        tracker = HarmonyChannelTracker()
+        tracker.feed(
+            encode(
+                ANALYSIS_OPEN + "Think.<|end|><|start|>assistant<|channel|>commentary"
+            )
+        )
+        assert tracker.forced_continuation_ids() == []
+
+    def test_tool_call_passes_through(self):
         tracker = HarmonyChannelTracker()
         tracker.feed(
             encode(
@@ -367,17 +388,60 @@ async def test_normal_stop_passes_through(stream):
 
 
 @pytest.mark.asyncio
-async def test_header_cut_off_passes_through(stream):
-    p1 = encode(ANALYSIS_OPEN + "Think.<|end|><|start|>assistant<|channel|>")
+@pytest.mark.parametrize(
+    "header",
+    [
+        "<|end|>",
+        "<|end|><|start|>",
+        "<|end|><|start|>assistant<|channel|>",
+        "<|end|><|start|>assistant<|channel|>final",
+    ],
+    ids=["after_end", "after_start", "in_channel", "after_final"],
+)
+async def test_header_cut_off_completes_the_switch(stream, header):
+    p1 = encode(ANALYSIS_OPEN + "Think." + header)
+    p2 = encode("The answer is 2.<|return|>")
     chat, engine = build_chat(
-        [outputs_for(p1, "length", stream=stream, prompt_token_ids=PROMPT_IDS)]
+        [
+            outputs_for(p1, "length", stream=stream, prompt_token_ids=PROMPT_IDS),
+            outputs_for(p2, "stop", stream=stream, prompt_token_ids=PHASE2_PROMPT_IDS),
+        ]
     )
     response = await complete(chat, make_request(stream=stream), stream)
     assert response.choices[0].message.reasoning == "Think."
-    # The parser's existing EOS-in-header recovery surfaces the partial
-    # header as text; the reserve logic must not add a continuation.
-    assert response.choices[0].finish_reason == "length"
-    assert len(engine.calls) == 1
+    assert response.choices[0].message.content == "The answer is 2."
+    assert response.choices[0].finish_reason == "stop"
+    assert len(engine.calls) == 2
+    rest = FORCED[len(encode(header)) :]
+    assert (
+        engine.calls[1]["prompt_token_ids"]
+        == engine.calls[0]["prompt_token_ids"] + p1 + rest
+    )
+    assert engine.calls[1]["max_tokens"] == MAX_TOKENS - len(p1) - len(rest)
+    assert engine.calls[1]["kwargs"]["reasoning_ended"] is True
+
+
+@pytest.mark.asyncio
+async def test_other_header_cut_off_continues_in_place(stream):
+    p1 = encode(
+        ANALYSIS_OPEN + "Think.<|end|><|start|>assistant<|channel|>commentary"
+    )
+    p2 = encode("<|message|>Two.<|return|>")
+    chat, engine = build_chat(
+        [
+            outputs_for(p1, "length", stream=stream, prompt_token_ids=PROMPT_IDS),
+            outputs_for(p2, "stop", stream=stream, prompt_token_ids=PHASE2_PROMPT_IDS),
+        ]
+    )
+    response = await complete(chat, make_request(stream=stream), stream)
+    assert response.choices[0].message.reasoning == "Think."
+    assert response.choices[0].finish_reason == "stop"
+    assert len(engine.calls) == 2
+    assert (
+        engine.calls[1]["prompt_token_ids"] == engine.calls[0]["prompt_token_ids"] + p1
+    )
+    assert engine.calls[1]["max_tokens"] == MAX_TOKENS - len(p1)
+    assert engine.calls[1]["kwargs"]["reasoning_ended"] is False
 
 
 @pytest.mark.asyncio

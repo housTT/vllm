@@ -14,7 +14,10 @@ budget for the final channel:
    and continues in a follow-up engine request whose prompt is the original
    prompt plus the reasoning tokens plus the switch tokens, with the remaining
    budget as ``max_tokens``. If it stops on ``length`` while already writing
-   the answer, the follow-up continues without forced tokens.
+   the answer, the follow-up continues without forced tokens. If it stops
+   right after the analysis message or inside the header of the next one, the
+   follow-up completes that header (forcing the rest of the switch when the
+   header is heading to the final channel).
 3. The follow-up outputs are re-based (original prompt fields, cumulative
    token ids) so the rest of the serving code sees one continuous request.
 
@@ -185,11 +188,16 @@ class HarmonyChannelTracker:
           switch to the final channel;
         - inside the final (or plain commentary) message: nothing, the
           continuation simply keeps writing the answer;
-        - anywhere else (message header, tool call in flight, off-grammar
+        - right after the analysis message, or inside the header the model
+          started next: the rest of the switch to the final channel when the
+          header matches it so far, otherwise nothing;
+        - anywhere else (tool call in flight, other headers, off-grammar
           output): ``None``.
         """
-        if not self.in_message_body:
+        if self.unknown:
             return None
+        if self._parser.state != StreamState.CONTENT:
+            return self._header_continuation_ids()
         if self._parser.current_recipient is not None:
             return None
         channel = self._parser.current_channel
@@ -198,6 +206,23 @@ class HarmonyChannelTracker:
         if channel in ("final", "commentary"):
             return []
         return None
+
+    def _header_continuation_ids(self) -> list[int] | None:
+        """Continuation when the cap fell after ``<|end|>`` or inside a header.
+
+        Only after a completed analysis message: when the header written so
+        far is a prefix of the final-channel switch, the rest of the switch is
+        forced; any other header is left for the model to finish.
+        """
+        messages = self._parser.messages
+        if not messages or messages[-1].channel != "analysis":
+            return None
+        force = HARMONY_FORCE_FINAL_TOKEN_IDS
+        tokens = list(self._parser.tokens)
+        for matched in range(min(len(tokens), len(force) - 1), 0, -1):
+            if tokens[-matched:] == list(force[:matched]):
+                return list(force[matched:])
+        return []
 
 
 def strip_finish(res: RequestOutput) -> RequestOutput:

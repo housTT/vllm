@@ -43,9 +43,9 @@ def _runner(**overrides):
     return runner
 
 
-def _eligible(runner):
+def _eligible(runner, *, is_decode=True):
     return TTModelRunner.check_perform_device_sampling(
-        runner, is_decode=True, has_structured_outputs=False
+        runner, is_decode=is_decode, has_structured_outputs=False
     )
 
 
@@ -57,7 +57,24 @@ def test_greedy_and_supported_unseeded_sampling_stay_on_device():
     assert _eligible(runner)
 
 
-def test_unsupported_seed_penalty_and_stochastic_top_k_use_host_sampler():
+def test_seeded_greedy_sampling_stays_on_device():
+    runner = _runner()
+    runner.input_batch.sampling.temperature[:] = 0
+    runner.input_batch.sampling.top_k[:] = 100
+    runner.input_batch.sampling.seed[0] = 42
+    assert _eligible(runner)
+    assert _eligible(runner, is_decode=False)
+
+
+def test_mixed_seeded_greedy_and_stochastic_rows_use_host_sampling():
+    runner = _runner()
+    runner.input_batch.sampling.temperature[0] = 0
+    runner.input_batch.sampling.seed[0] = 42
+    runner.input_batch.sampling.seed[1] = 43
+    assert not _eligible(runner)
+
+
+def test_seeded_stochastic_penalty_and_stochastic_top_k_use_host_sampler():
     runner = _runner()
     runner.input_batch.sampling.seed[0] = 42
     assert not _eligible(runner)

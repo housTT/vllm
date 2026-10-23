@@ -2729,7 +2729,15 @@ class TTModelRunner:
         # continue through the traced device sampler.
         if not self.supports_device_seeded_sampling:
             active_seeds = input_batch.sampling.seed[: input_batch.num_reqs]
-            if bool((active_seeds != SEED_NONE_SENTINEL).any().item()):
+            active_temperatures = input_batch.sampling.temperature[: input_batch.num_reqs]
+            # Seeds cannot change an argmax result.  Keep explicitly seeded
+            # greedy evaluations on the device while retaining host sampling
+            # for every seeded stochastic row, where row relocation would
+            # otherwise change its RNG stream.
+            seeded_stochastic = (active_seeds != SEED_NONE_SENTINEL) & (
+                active_temperatures > 0
+            )
+            if bool(seeded_stochastic.any().item()):
                 return False
 
         # Do not silently clamp a stochastic request beyond the model's

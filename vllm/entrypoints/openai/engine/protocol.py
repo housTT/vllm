@@ -256,9 +256,11 @@ class ExtractedToolCallInformation(BaseModel):
 
 
 class DeltaMessage(OpenAIBaseModel):
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = None
+    reasoning: str | None = Field(default=None, alias="reasoning_content")
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
 
 

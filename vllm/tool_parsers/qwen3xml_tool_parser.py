@@ -761,6 +761,12 @@ class StreamingXMLToolCallParser:
                 original_data = original_data[:-1]
             self.current_param_value += original_data
 
+            # Converted scalar prefixes are not append-only: "t" becomes false
+            # before "true" arrives, and "1e-5" can change every output digit.
+            # Emit the complete scalar when its parameter closes.
+            if self._is_scalar_param_type(param_type):
+                return
+
             # convert parameter value by param_type
             converted_value = self._convert_param_value(
                 self.current_param_value, param_type
@@ -887,6 +893,25 @@ class StreamingXMLToolCallParser:
                         ]
                     )
                     self._emit_delta(delta)
+
+            elif self._is_scalar_param_type(param_type):
+                self._emit_delta(
+                    DeltaMessage(
+                        tool_calls=[
+                            DeltaToolCall(
+                                index=self.tool_call_index - 1,
+                                id=self.current_call_id,
+                                type="function",
+                                function=DeltaFunctionCall(
+                                    name=None,
+                                    arguments=json.dumps(
+                                        converted_value, ensure_ascii=False
+                                    ),
+                                ),
+                            )
+                        ]
+                    )
+                )
 
             self.should_emit_end_newline = False
             # Store converted value
@@ -1057,6 +1082,12 @@ class StreamingXMLToolCallParser:
         else:
             return "string"
 
+    @staticmethod
+    def _is_scalar_param_type(param_type: str) -> bool:
+        return param_type in ("boolean", "bool", "binary") or param_type.startswith(
+            ("int", "uint", "long", "short", "unsigned", "num", "float")
+        )
+
     def _convert_param_value(self, param_value: str, param_type: str) -> Any:
         """Convert value based on parameter type
         Args:
@@ -1066,12 +1097,11 @@ class StreamingXMLToolCallParser:
         Returns:
             Converted value
         """
-        if param_value.lower() == "null":
-            return None
-
         param_type = param_type.strip().lower()
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
             return param_value
+        elif param_value.lower() == "null":
+            return None
         elif (
             param_type.startswith("int")
             or param_type.startswith("uint")

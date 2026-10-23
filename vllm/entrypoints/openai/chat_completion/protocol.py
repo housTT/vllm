@@ -13,7 +13,7 @@ from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -51,6 +51,8 @@ _LONG_INFO = torch.iinfo(torch.long)
 
 
 class ChatMessage(OpenAIBaseModel):
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
     role: str
     content: str | None = None
     refusal: str | None = None
@@ -60,7 +62,7 @@ class ChatMessage(OpenAIBaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
 
     # vLLM-specific fields that are not in OpenAI spec
-    reasoning: str | None = None
+    reasoning: str | None = Field(default=None, alias="reasoning_content")
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):

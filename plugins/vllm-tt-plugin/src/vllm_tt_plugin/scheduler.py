@@ -120,6 +120,10 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        # Import after platform configuration and scheduler construction.
+        from vllm_tt_plugin.platform import _ornith_fair_chunked_prefill
+
+        self._ornith_selective_prefill = _ornith_fair_chunked_prefill(self.vllm_config)
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -150,6 +154,16 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result)
 
+        # After cache pressure preempts a request, let resident decoders
+        # finish before admitting more prefill. A replay may fit its first
+        # chunk but not its full history; immediately readmitting it can
+        # repeatedly discard the same replay while decoders barely advance.
+        if getattr(self, "_tt_drain_decodes_after_preemption", False):
+            if has_running:
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
+            self._tt_drain_decodes_after_preemption = False
+
         # Default mode:
         # Prefer prefill whenever there is pending prefill work - either new
         # requests in the waiting queue or partial-prefill continuations in
@@ -173,6 +187,85 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         return scheduler_output
 
+    def _use_ornith_fair_prefill(self) -> bool:
+        """Bound selective fairness to one exclusive, fresh active8 opportunity.
+
+        This neither reserves pages nor predicts future arrivals. Recheck each
+        prefill decision; outside this cohort use the original base batching.
+        """
+        requests = list(self.running) + list(self.waiting)
+        if (
+            not 1 <= len(requests) <= 8
+            or set(self.requests) != {r.request_id for r in requests}
+            or any(not r.is_prefill_chunk for r in self.running)
+            or self.finished_req_ids
+            or self.max_num_running_reqs != 32
+            or self.max_num_scheduled_tokens != 262144
+            or self.max_model_len != 262144
+            or self.cache_config.enable_prefix_caching
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.num_lookahead_tokens
+        ):
+            return False
+        groups = self.kv_cache_config.kv_cache_groups
+        pool = self.kv_cache_manager.block_pool
+        if (
+            len(groups) != 1
+            or groups[0].kv_cache_spec.block_size != 64
+            or pool.num_gpu_blocks != 4129
+        ):
+            return False
+        spans = {(r.num_prompt_tokens, r.max_tokens) for r in requests}
+        if len(spans) != 1:
+            return False
+        prompt, completion = next(iter(spans))
+        if (
+            type(prompt) is not int
+            or type(completion) is not int
+            or prompt <= 0
+            or completion <= 0
+            or prompt + completion > self.max_model_len
+        ):
+            return False
+        maximum_blocks = (prompt + completion + 63) // 64
+        usable_blocks = pool.num_gpu_blocks - 1  # The pool owns one null block.
+        if min(self.max_num_running_reqs, usable_blocks // maximum_blocks) != 8:
+            return False
+        free_blocks = pool.get_num_free_blocks()
+        if type(free_blocks) is not int or not 0 <= free_blocks <= usable_blocks:
+            return False
+        owned: set[int] = set()
+        needed = 0
+        for request in requests:
+            if (
+                request.num_preemptions
+                or request.num_tokens != prompt
+                or request.num_output_placeholders
+                or request.spec_token_ids
+                or request.num_external_computed_tokens
+                or request.has_encoder_inputs
+            ):
+                return False
+            block_groups = self.kv_cache_manager.get_blocks(request.request_id).blocks
+            if len(block_groups) != 1:
+                return False
+            blocks = block_groups[0]
+            computed_blocks = (request.num_computed_tokens + 63) // 64
+            if not computed_blocks <= len(blocks) <= maximum_blocks:
+                return False
+            needed += maximum_blocks - len(blocks)
+            for block in blocks:
+                if (
+                    block.is_null
+                    or block.ref_cnt != 1
+                    or block.block_id in owned
+                    or not 0 <= block.block_id < pool.num_gpu_blocks
+                ):
+                    return False
+                owned.add(block.block_id)
+        return free_blocks + len(owned) == usable_blocks and needed <= free_blocks
+
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests + partial-prefill continuations.
 
@@ -181,6 +274,16 @@ class TTScheduler(AsyncScheduler):
         the waiting loop admits new prefills.  Adjusts ``max_num_running_reqs`` to
         account for hidden decode slots.
         """
+        saved_prefill_policy = None
+        if self._ornith_selective_prefill:
+            fair = self._use_ornith_fair_prefill()
+            saved_prefill_policy = (
+                self.scheduler_config.enable_chunked_prefill,
+                self.scheduler_config.long_prefill_token_threshold,
+            )
+            self.scheduler_config.enable_chunked_prefill = fair
+            self.scheduler_config.long_prefill_token_threshold = 8192 if fair else 0
+
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
@@ -192,6 +295,15 @@ class TTScheduler(AsyncScheduler):
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            if saved_prefill_policy is not None:
+                (
+                    self.scheduler_config.enable_chunked_prefill,
+                    self.scheduler_config.long_prefill_token_threshold,
+                ) = saved_prefill_policy
+        # Preserve the phase chosen here, including one-token final chunks of
+        # history replay after preemption. Original prompt length cannot identify
+        # those chunks once replay reaches previously generated tokens.
+        result._tt_prefill_req_ids = set(result.num_scheduled_tokens)
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
@@ -229,6 +341,7 @@ class TTScheduler(AsyncScheduler):
         scheduler treats the request as a fresh prefill.
         """
         super()._preempt_request(request, timestamp)
+        self._tt_drain_decodes_after_preemption = True
 
         if not self.scheduler_config.async_scheduling:
             return

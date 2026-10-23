@@ -87,17 +87,29 @@ def apply_cached_req_state_update(
     num_computed_tokens: int,
     new_block_ids,
     resumed_from_preemption: bool,
+    *,
+    all_token_ids: list[int] | None = None,
+    num_output_tokens: int | None = None,
 ) -> None:
     """Apply a ``scheduled_cached_reqs`` update to a request's cached state.
 
     Identical for front-packed and lane-DP: a request resumed from preemption
     had its KV freed and rebuilt (replace block IDs), otherwise the newly
     allocated blocks are appended. Persistent-batch row bookkeeping is left to
-    the caller.
+    the caller. Async outputs discarded by the scheduler may already be in the
+    worker history; restore its authoritative committed history before replay.
     """
+    if resumed_from_preemption:
+        assert all_token_ids is not None and num_output_tokens is not None
+        prompt = req_state.prompt_token_ids
+        assert prompt is not None and all_token_ids[: len(prompt)] == prompt
+        assert num_output_tokens >= 0
+        assert len(all_token_ids) == len(prompt) + num_output_tokens
+        assert new_block_ids is not None
+        # Preserve aliases held by persistent input batches.
+        req_state.output_token_ids[:] = all_token_ids[len(prompt) :]
     req_state.num_computed_tokens = num_computed_tokens
     if resumed_from_preemption:
-        assert new_block_ids is not None
         req_state.block_ids = new_block_ids
     elif new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -888,7 +900,16 @@ class TTLaneInputBatch(InputBatch):
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                all_token_ids=(
+                    req_data.all_token_ids[req_id] if resumed_from_preemption else None
+                ),
+                num_output_tokens=(
+                    req_data.num_output_tokens[i] if resumed_from_preemption else None
+                ),
             )
             if resumed_from_preemption:
                 # KV was freed and is being rebuilt; re-add fresh (drop the

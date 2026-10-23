@@ -667,7 +667,16 @@ class TTModelRunner:
 
             # Update the cached states.
             apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
+                req_state,
+                num_computed_tokens,
+                new_block_ids,
+                resumed_from_preemption,
+                all_token_ids=(
+                    req_data.all_token_ids[req_id] if resumed_from_preemption else None
+                ),
+                num_output_tokens=(
+                    req_data.num_output_tokens[i] if resumed_from_preemption else None
+                ),
             )
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
@@ -857,9 +866,19 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        # Continuations already own hybrid state. Reserve all such slots
+        # before allocating new requests, even when batch row order changes.
+        retained = {
+            req_id: self._req_state_slot[req_id]
+            for req_id in row_req_ids
+            if req_id in self._req_state_slot
+        }
+        held.update(retained.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            if req_id in retained:
+                slot = retained[req_id]
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -1054,6 +1073,7 @@ class TTModelRunner:
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
         num_sched = scheduler_output.num_scheduled_tokens
+        prefill_req_ids = getattr(scheduler_output, "_tt_prefill_req_ids", set())
         # A "prefill" step can contain:
         # - brand new requests (scheduled_new_reqs), and/or
         # - resumed-from-preemption requests (scheduled_cached_reqs with
@@ -1062,7 +1082,8 @@ class TTModelRunner:
         # - chunked-prefill continuations (cached requests that haven't
         #   finished computing all their prompt tokens yet).
         has_chunked_continuation = any(
-            input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
+            req_id in prefill_req_ids
+            or input_batch.num_computed_tokens_cpu[input_batch.req_id_to_index[req_id]]
             < input_batch.num_prompt_tokens[input_batch.req_id_to_index[req_id]]
             for req_id in cached_reqs.req_ids
             if req_id not in cached_reqs.resumed_req_ids
@@ -1083,6 +1104,7 @@ class TTModelRunner:
             if cached_reqs.num_reqs > 0:
                 any_decode_in_prefill = any(
                     req_id not in cached_reqs.resumed_req_ids
+                    and req_id not in prefill_req_ids
                     and input_batch.num_computed_tokens_cpu[
                         input_batch.req_id_to_index[req_id]
                     ]
@@ -1212,8 +1234,11 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
+        masked_prefill_sampling = self.tt_data_parallel_size == 1 and getattr(
+            self.model, "model_capabilities", {}
+        ).get("supports_masked_prefill_sampling", False)
         if is_prompt and (
-            intermediate_prefill_mask.any()
+            (intermediate_prefill_mask.any() and not masked_prefill_sampling)
             or (
                 self.tt_data_parallel_size > 1
                 and self.scheduler_config.enable_chunked_prefill
@@ -2621,7 +2646,15 @@ class TTModelRunner:
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
         if max_lp is not None:
-            if num_devices not in (8, 32):
+            raw_devices = getattr(self.model, "model_capabilities", {}).get(
+                "sampled_raw_logprobs_devices", ()
+            )
+            sampled_raw = (
+                max_lp == 0
+                and num_devices in raw_devices
+                and self.model_config.logprobs_mode == "raw_logprobs"
+            )
+            if num_devices not in (8, 32) and not sampled_raw:
                 return False
             if max_lp > 0 and not self.supports_topk_logprobs:
                 return False
@@ -2654,6 +2687,16 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        if (
+            self.tt_data_parallel_size == 1
+            and getattr(self.model, "model_capabilities", {}).get(
+                "supports_masked_prefill_sampling", False
+            )
+            and model_input.intermediate_prefill_mask is not None
+        ):
+            kwargs["intermediate_prefill_mask"] = (
+                model_input.intermediate_prefill_mask.tolist()
+            )
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {

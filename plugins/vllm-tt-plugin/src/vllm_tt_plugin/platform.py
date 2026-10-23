@@ -46,11 +46,55 @@ _GALAXY_GENERATOR_VERSIONS = {
 _CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
 
 
+def _ornith_fair_chunked_prefill(vllm_config: "VllmConfig") -> bool:
+    """Experimental native TP4 autoport opt-in, available before registration."""
+    model = vllm_config.model_config
+    if os.environ.get("ORNITH_FAIR_CHUNKED_PREFILL", "0") != "1" or getattr(
+        model.hf_config, "architectures", None
+    ) not in (["OrnithForCausalLM"], ["TTOrnithForCausalLM"]):
+        return False
+    tt_config = get_tt_config(vllm_config)
+    parallel = vllm_config.parallel_config
+    if not (
+        isinstance(tt_config, dict)
+        and getattr(model.hf_config, "model_type", None) == "qwen3_5"
+        and model.max_model_len == 262144
+        and vllm_config.scheduler_config.max_num_seqs == 32
+        and os.environ.get("MESH_DEVICE") == "P150x4"
+        and os.environ.get("TT_VISIBLE_DEVICES") == "0,1,2,3"
+        and not os.environ.get("TT_MESH_GRAPH_DESC_PATH")
+        and os.environ.get("ORNITH_VLLM_POOL_TOKENS") == "262208"
+        and os.environ.get("ORNITH_VLLM_ALLOW_HOST_SAMPLING", "0") == "0"
+        and os.environ.get("ORNITH_PREFIX_CACHE_BYTES", "0") == "0"
+        and os.environ.get("ORNITH_ACTIVE8_MODE") == "active8"
+        and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
+        and get_tt_data_parallel_size(vllm_config) == 1
+        and tt_config.get("sample_on_device_mode") == "all"
+        and tt_config.get("trace_region_size") == 100000000
+    ):
+        raise ValueError(
+            "Ornith fair chunking requires the qualified native "
+            "TP4/B32 active8 device-sampling profile"
+        )
+    return True
+
+
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
     """Restricts token-chunked prefill to model types Metal has validated."""
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
     model_type = getattr(model_config.hf_config, "model_type", None)
+
+    if _ornith_fair_chunked_prefill(vllm_config):
+        scheduler_config.enable_chunked_prefill = True
+        scheduler_config.max_num_batched_tokens = 262144
+        scheduler_config.long_prefill_token_threshold = 0
+        logger.info(
+            "Experimental Ornith selective prefill: total budget262144, "
+            "exclusive projected active8 cohort chunk8192; original batching "
+            "otherwise; native context unchanged"
+        )
+        return
 
     if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
         # A chunk boundary inside a multimodal item would split its embeddings
@@ -545,6 +589,8 @@ class TTPlatform(Platform):
     device_name: str = "tt"
     device_type: str = "tt"
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
+    _ornith_device_sampling_only: ClassVar[bool] = False
+    _ornith_sampled_raw_logprobs: ClassVar[bool] = False
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -698,11 +744,27 @@ class TTPlatform(Platform):
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import get_model_architecture
 
-        model_class, _ = get_model_architecture(vllm_config.model_config)
+        model_class, model_arch = get_model_architecture(vllm_config.model_config)
+        # Match the selected adapter's startup policy, and reset it for every
+        # config so another TT model does not inherit Ornith's restriction.
+        cls._ornith_device_sampling_only = (
+            model_arch == "TTOrnithForCausalLM"
+            and os.environ.get("ORNITH_VLLM_ALLOW_HOST_SAMPLING", "0") != "1"
+        )
 
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
+        )
+
+        # Frontend admission is deliberately restricted to the qualified named
+        # TP4 profile. The runner additionally checks the actual opened mesh.
+        cls._ornith_sampled_raw_logprobs = bool(
+            model_arch == "TTOrnithForCausalLM"
+            and model_capabilities
+            and 4 in model_capabilities.get("sampled_raw_logprobs_devices", ())
+            and os.environ.get("MESH_DEVICE") == "P150x4"
+            and vllm_config.model_config.logprobs_mode == "raw_logprobs"
         )
 
         # A model either supports the full on-device sampling pipeline or it
@@ -817,8 +879,38 @@ class TTPlatform(Platform):
 
         dev = cls.device_name
 
-        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
+        if not isinstance(params, SamplingParams):
+            return
+        if params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        if cls._ornith_device_sampling_only:
+            from vllm.exceptions import VLLMValidationError
+
+            # Validate canonical SamplingParams before EngineCore admission.
+            # Unsupported settings select host sampling. A qualified TP4 raw
+            # sampled-token logprob request remains on device.
+            for parameter, requires_host in (
+                ("min_p", params.min_p != 0.0),
+                ("bad_words", bool(params.bad_words)),
+                ("logit_bias", bool(params.logit_bias)),
+                ("allowed_token_ids", bool(params.allowed_token_ids)),
+                ("min_tokens", params.min_tokens != 0),
+                ("structured_outputs", params.structured_outputs is not None),
+                (
+                    "logprobs",
+                    params.logprobs is not None
+                    and not (params.logprobs == 0 and cls._ornith_sampled_raw_logprobs),
+                ),
+            ):
+                if requires_host:
+                    raise VLLMValidationError(
+                        f"Ornith requires host sampling for {parameter}, but host "
+                        "compatibility is disabled. Remove this parameter or "
+                        "restart the server with "
+                        "ORNITH_VLLM_ALLOW_HOST_SAMPLING=1.",
+                        parameter=parameter,
+                    )
 
     @staticmethod
     def compat_sampling_required(sampling_params, num_devices) -> bool:
